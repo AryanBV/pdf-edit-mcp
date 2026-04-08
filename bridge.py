@@ -260,7 +260,6 @@ def handle_inspect(params):
     # Reuse existing engine functions
     text = get_text(pdf_path)
     fonts_raw = get_fonts(pdf_path)
-    paragraphs_raw = detect_paragraphs(pdf_path, page=0)
 
     # Serialize fonts (same pattern as handle_get_fonts)
     fonts = [
@@ -272,27 +271,35 @@ def handle_inspect(params):
         for f in fonts_raw
     ]
 
-    # Serialize paragraphs (same pattern as handle_detect_paragraphs)
-    paragraphs = [
-        {
-            "text": p.full_text,
-            "bbox": {
-                "x0": p.left_margin,
-                "y0": p.first_line_y - (p.line_count - 1) * p.line_height,
-                "x1": p.left_margin + p.paragraph_width,
-                "y1": p.first_line_y + p.line_height,
-            },
-            "font_name": p.font_name,
-            "font_size": p.font_size,
-            "page": 0,
-        }
-        for p in paragraphs_raw
-    ]
-
-    # Extract annotations via pikepdf
+    # Extract annotations via pikepdf and get page_count
     annotations = []
     with pikepdf.open(pdf_path) as pdf:
         page_count = len(pdf.pages)
+
+    # Detect paragraphs on ALL pages (max 20 to prevent timeouts)
+    max_pages = min(page_count, 20)
+    paragraphs = []
+    for page_idx in range(max_pages):
+        try:
+            page_paragraphs = detect_paragraphs(pdf_path, page=page_idx)
+        except Exception:
+            continue  # Skip pages that fail (e.g., empty pages)
+        for p in page_paragraphs:
+            paragraphs.append({
+                "text": p.full_text,
+                "bbox": {
+                    "x0": p.left_margin,
+                    "y0": p.first_line_y - (p.line_count - 1) * p.line_height,
+                    "x1": p.left_margin + p.paragraph_width,
+                    "y1": p.first_line_y + p.line_height,
+                },
+                "font_name": p.font_name,
+                "font_size": p.font_size,
+                "page": page_idx,
+            })
+
+    # Extract annotations via pikepdf
+    with pikepdf.open(pdf_path) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             annots = page.get("/Annots")
             if annots is None:
