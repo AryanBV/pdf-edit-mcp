@@ -15,6 +15,8 @@ import {
   detectParagraphsInputSchema,
   analyzeSubsetInputSchema,
   replaceSingleInputSchema,
+  inspectInputSchema,
+  updateAnnotationInputSchema,
 } from "./schemas.js";
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -214,8 +216,8 @@ server.registerTool(
   "pdf_get_text",
   {
     description:
-      "Extract all text from a PDF file and return the page count. " +
-      "Use this to read PDF content before editing.",
+      "Extract all text from a PDF. For comprehensive understanding before editing, " +
+      "use pdf_inspect instead — it returns text, fonts, structure, and annotations in one call.",
     inputSchema: getTextInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -240,8 +242,8 @@ server.registerTool(
   "pdf_find_text",
   {
     description:
-      "Search for text in a PDF and return matches with page numbers " +
-      "and bounding box positions. Useful for locating text before replacing.",
+      "Find all occurrences of a search string with positions and page numbers. " +
+      "Use to verify text exists before a targeted edit.",
     inputSchema: findTextInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -270,8 +272,9 @@ server.registerTool(
   "pdf_replace_text",
   {
     description:
-      "Find and replace all occurrences of text in a PDF, preserving " +
-      "fonts and layout. Returns fidelity report on font preservation.",
+      "Replace ALL occurrences of a search string. For edits involving 2+ changes " +
+      "(titles, descriptions, tech stacks), use pdf_batch_replace instead. " +
+      "Call pdf_inspect first to understand the document.",
     inputSchema: replaceTextInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -312,9 +315,9 @@ server.registerTool(
   "pdf_batch_replace",
   {
     description:
-      "Apply multiple find-and-replace operations to a PDF in a single " +
-      "pass. More efficient than multiple individual replacements. " +
-      "Max 500 edits per call.",
+      "Apply multiple text replacements in one atomic operation. PREFERRED tool for any " +
+      "edit involving 2+ related changes — section rewrites, project swaps, template fills. " +
+      "Include ALL related changes in one call. Never split related edits across multiple calls.",
     inputSchema: batchReplaceInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -353,8 +356,7 @@ server.registerTool(
   "pdf_get_fonts",
   {
     description:
-      "List all fonts used in a PDF with encoding and subset details. " +
-      "Useful for understanding font constraints before editing.",
+      "List fonts with encoding details. Use pdf_inspect for a combined view.",
     inputSchema: getFontsInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -379,9 +381,7 @@ server.registerTool(
   "pdf_detect_paragraphs",
   {
     description:
-      "Detect paragraph blocks on a page of a PDF. Returns text content, " +
-      "bounding box, font info, and line count for each paragraph. " +
-      "Useful for understanding document structure before editing.",
+      "Detect paragraph boundaries with bounding boxes. Use pdf_inspect for a combined view.",
     inputSchema: detectParagraphsInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -409,9 +409,8 @@ server.registerTool(
   "pdf_analyze_subset",
   {
     description:
-      "Check whether a font embedded in a PDF can render specific text. " +
-      "Returns which glyphs are available and which are missing. " +
-      "Use before replacing text to verify the font supports the new characters.",
+      "Check if a font can render specific text before editing. Call this when " +
+      "replacement text contains unusual characters, symbols, or non-Latin scripts.",
     inputSchema: analyzeSubsetInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -440,9 +439,8 @@ server.registerTool(
   "pdf_replace_single",
   {
     description:
-      "Replace a single occurrence of text in a PDF by match index. " +
-      "Use pdf_find_text first to see all matches and pick the index. " +
-      "Supports disabling reflow for precise control.",
+      "Replace only one specific occurrence by match index. Call pdf_find_text first " +
+      "to see all matches and choose the right index.",
     inputSchema: replaceSingleInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -476,6 +474,140 @@ server.registerTool(
       return toolError(err instanceof Error ? err.message : String(err));
     }
   }
+);
+
+// ── Tool: pdf_inspect ────────────────────────────────────────────────
+
+server.registerTool(
+  "pdf_inspect",
+  {
+    description:
+      "Get a complete overview of a PDF — text, fonts, paragraph structure, and " +
+      "annotations (links, bookmarks). This should be your FIRST call before any " +
+      "editing operation. Returns everything needed to plan comprehensive edits.",
+    inputSchema: inspectInputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path }) => {
+    try {
+      const result = await bridge.call("inspect", { pdf_path });
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── Tool: pdf_update_annotation ─────────────────────────────────────
+
+server.registerTool(
+  "pdf_update_annotation",
+  {
+    description:
+      "Update a link URL in a PDF annotation. Use pdf_inspect first to find annotation " +
+      "indices and current URLs. This only changes the link target — to change the visible " +
+      "link text, use pdf_replace_text or pdf_batch_replace. Always do text edits BEFORE " +
+      "annotation updates, as text edits may shift annotation indices.",
+    inputSchema: updateAnnotationInputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, page, annotation_index, url, output_path }) => {
+    try {
+      const warnings: string[] = [];
+      if (output_path === pdf_path) {
+        warnings.push(
+          "Warning: output_path is the same as pdf_path. The original file will be overwritten."
+        );
+      }
+      const result = await bridge.call("update_annotation", {
+        pdf_path,
+        page,
+        annotation_index,
+        url,
+        output_path,
+      });
+      if (warnings.length > 0) {
+        const data = result as Record<string, unknown>;
+        data.warnings = warnings;
+      }
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── MCP Prompts ─────────────────────────────────────────────────────
+
+server.registerPrompt(
+  "comprehensive-pdf-edit",
+  {
+    description:
+      "Workflow for structural PDF edits — section swaps, rewrites, multi-field updates",
+  },
+  async () => ({
+    messages: [
+      {
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            "When editing a PDF document, follow this workflow:\n\n" +
+            "STEP 1 — READ: Call pdf_inspect to get the full document overview.\n" +
+            "Summarize sections, headings, content blocks, fonts, and links.\n\n" +
+            "STEP 2 — PLAN: Identify EVERY text change needed. Present as a table:\n" +
+            "| # | Current text (first 60 chars) | Replacement text | Section |\n" +
+            "Include titles, subtitles, tech stacks, descriptions, bullet points.\n" +
+            "List link URL updates separately.\n" +
+            "Ask the user to confirm before proceeding.\n\n" +
+            "STEP 3 — PRE-CHECK: For replacement text with unusual characters,\n" +
+            "call pdf_analyze_subset to verify font support.\n\n" +
+            "STEP 4 — EXECUTE: Send ALL text edits in ONE pdf_batch_replace call.\n" +
+            "Then update annotation URLs via pdf_update_annotation if needed.\n\n" +
+            "STEP 5 — VERIFY: Check the verification data in the batch_replace response.\n" +
+            "If any replacements are unconfirmed, call pdf_get_text on the output.\n\n" +
+            "RULES:\n" +
+            '- "Swap" or "replace" a section means ALL its content — title, subtitle,\n' +
+            "  tech stack, every bullet point, links.\n" +
+            "- Never edit without completing Steps 1-2 first.\n" +
+            "- Never execute without user confirmation.\n" +
+            "- Keep replacement text similar in length to original when possible.",
+        },
+      },
+    ],
+  })
+);
+
+server.registerPrompt(
+  "quick-pdf-edit",
+  {
+    description: "Quick single-text replacement — typos, dates, names",
+  },
+  async () => ({
+    messages: [
+      {
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            "For simple text changes:\n" +
+            "1. Call pdf_find_text to locate and confirm the text exists\n" +
+            "2. Call pdf_replace_text or pdf_replace_single\n" +
+            "3. Check font_preserved in the fidelity report",
+        },
+      },
+    ],
+  })
 );
 
 // ── Startup ──────────────────────────────────────────────────────────

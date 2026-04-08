@@ -11,6 +11,8 @@ import {
   detectParagraphsInputSchema,
   analyzeSubsetInputSchema,
   replaceSingleInputSchema,
+  inspectInputSchema,
+  updateAnnotationInputSchema,
 } from "../src/schemas.js";
 
 describe("Zod schema validation", () => {
@@ -251,6 +253,110 @@ describe("Zod schema validation", () => {
         match_index: -1,
         replacement: "new",
         output_path: "C:/docs/output.pdf",
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── inspectInputSchema ────────────────────────────────────────
+
+  describe("inspectInputSchema", () => {
+    it("rejects missing pdf_path", () => {
+      const result = inspectInputSchema.safeParse({});
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts valid input", () => {
+      const result = inspectInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects extra properties (strict)", () => {
+      const result = inspectInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+        extra: true,
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── updateAnnotationInputSchema ───────────────────────────────
+
+  describe("updateAnnotationInputSchema", () => {
+    it("validates full input", () => {
+      const result = updateAnnotationInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+        page: 0,
+        annotation_index: 0,
+        url: "https://example.com",
+        output_path: "C:/docs/output.pdf",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects negative page", () => {
+      const result = updateAnnotationInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+        page: -1,
+        annotation_index: 0,
+        url: "https://example.com",
+        output_path: "C:/docs/output.pdf",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects negative annotation_index", () => {
+      const result = updateAnnotationInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+        page: 0,
+        annotation_index: -1,
+        url: "https://example.com",
+        output_path: "C:/docs/output.pdf",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects missing url", () => {
+      const result = updateAnnotationInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+        page: 0,
+        annotation_index: 0,
+        output_path: "C:/docs/output.pdf",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects empty url", () => {
+      const result = updateAnnotationInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+        page: 0,
+        annotation_index: 0,
+        url: "",
+        output_path: "C:/docs/output.pdf",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects extra properties (strict)", () => {
+      const result = updateAnnotationInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+        page: 0,
+        annotation_index: 0,
+        url: "https://example.com",
+        output_path: "C:/docs/output.pdf",
+        extra: true,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects missing output_path", () => {
+      const result = updateAnnotationInputSchema.safeParse({
+        pdf_path: "C:/docs/file.pdf",
+        page: 0,
+        annotation_index: 0,
+        url: "https://example.com",
       });
       expect(result.success).toBe(false);
     });

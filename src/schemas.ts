@@ -141,3 +141,30 @@ export const replaceSingleInputSchema = z
       .describe("Whether to reflow text if replacement is wider (default: true)"),
   })
   .strict();
+
+export const inspectInputSchema = z
+  .object({
+    pdf_path: pdfPathSchema,
+  })
+  .strict();
+
+export const updateAnnotationInputSchema = z
+  .object({
+    pdf_path: pdfPathSchema,
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .describe("0-indexed page number containing the annotation"),
+    annotation_index: z
+      .number()
+      .int()
+      .min(0)
+      .describe("Index of the annotation on the page (from pdf_inspect)"),
+    url: z
+      .string()
+      .min(1, "URL must not be empty")
+      .describe("New URL for the link annotation"),
+    output_path: outputPathSchema,
+  })
+  .strict();

@@ -143,6 +143,27 @@ def handle_batch_replace(params):
         })
 
     succeeded = sum(1 for r in results if r.success)
+
+    # Auto-verification: read output and check replacements appear
+    verification = {
+        "output_text_preview": "",
+        "all_replacements_confirmed": True,
+        "unconfirmed": [],
+    }
+    try:
+        output_text = get_text(output_path)
+        verification["output_text_preview"] = output_text[:500]
+        for edit in params["edits"]:
+            replace_str = edit["replace"]
+            if not replace_str:
+                continue  # Empty replacement — skip
+            if replace_str not in output_text:
+                verification["all_replacements_confirmed"] = False
+                verification["unconfirmed"].append(replace_str)
+    except Exception as e:
+        print(f"Verification warning: {e}", file=sys.stderr)
+        verification["all_replacements_confirmed"] = False
+
     return {
         "results": mapped,
         "summary": {
@@ -150,6 +171,7 @@ def handle_batch_replace(params):
             "succeeded": succeeded,
             "failed": len(results) - succeeded,
         },
+        "verification": verification,
     }
 
 
@@ -232,6 +254,120 @@ def handle_analyze_subset(params):
     }
 
 
+def handle_inspect(params):
+    pdf_path = params["pdf_path"]
+
+    # Reuse existing engine functions
+    text = get_text(pdf_path)
+    fonts_raw = get_fonts(pdf_path)
+    paragraphs_raw = detect_paragraphs(pdf_path, page=0)
+
+    # Serialize fonts (same pattern as handle_get_fonts)
+    fonts = [
+        {
+            "name": f.name,
+            "encoding_type": f.encoding_type,
+            "is_subset": f.is_subset,
+        }
+        for f in fonts_raw
+    ]
+
+    # Serialize paragraphs (same pattern as handle_detect_paragraphs)
+    paragraphs = [
+        {
+            "text": p.full_text,
+            "bbox": {
+                "x0": p.left_margin,
+                "y0": p.first_line_y - (p.line_count - 1) * p.line_height,
+                "x1": p.left_margin + p.paragraph_width,
+                "y1": p.first_line_y + p.line_height,
+            },
+            "font_name": p.font_name,
+            "font_size": p.font_size,
+            "page": 0,
+        }
+        for p in paragraphs_raw
+    ]
+
+    # Extract annotations via pikepdf
+    annotations = []
+    with pikepdf.open(pdf_path) as pdf:
+        page_count = len(pdf.pages)
+        for page_idx, page in enumerate(pdf.pages):
+            annots = page.get("/Annots")
+            if annots is None:
+                continue
+            for ann_idx, annot_ref in enumerate(annots):
+                annot = annot_ref
+                if hasattr(annot, "resolve"):
+                    annot = annot.resolve()
+                subtype = str(annot.get("/Subtype", ""))
+                # Clean pikepdf Name prefix
+                if subtype.startswith("/"):
+                    subtype = subtype[1:]
+                rect = [float(x) for x in annot.get("/Rect", [])]
+                entry = {
+                    "index": ann_idx,
+                    "subtype": subtype,
+                    "rect": rect,
+                    "page": page_idx,
+                }
+                # Extract URL for Link annotations
+                if subtype == "Link":
+                    a_dict = annot.get("/A")
+                    if a_dict is not None:
+                        if hasattr(a_dict, "resolve"):
+                            a_dict = a_dict.resolve()
+                        uri = str(a_dict.get("/URI", ""))
+                        if uri:
+                            entry["url"] = uri
+                annotations.append(entry)
+
+    return {
+        "page_count": page_count,
+        "text": text,
+        "fonts": fonts,
+        "paragraphs": paragraphs,
+        "annotations": annotations,
+    }
+
+
+def handle_update_annotation(params):
+    pdf_path = params["pdf_path"]
+    page_num = params["page"]
+    annotation_index = params["annotation_index"]
+    new_url = params["url"]
+    output_path = params["output_path"]
+
+    with pikepdf.open(pdf_path) as pdf:
+        if page_num < 0 or page_num >= len(pdf.pages):
+            raise PDFEditError(
+                f"Page {page_num} out of range (PDF has {len(pdf.pages)} pages)"
+            )
+        page = pdf.pages[page_num]
+        annots = page.get("/Annots")
+        if annots is None:
+            raise PDFEditError("Page has no annotations")
+        if annotation_index < 0 or annotation_index >= len(annots):
+            raise PDFEditError(
+                f"Annotation index {annotation_index} out of range "
+                f"(page has {len(annots)} annotations)"
+            )
+        annot = annots[annotation_index]
+        if hasattr(annot, "resolve"):
+            annot = annot.resolve()
+        a_dict = annot.get("/A")
+        if a_dict is None:
+            raise PDFEditError("Annotation has no /A dictionary")
+        if hasattr(a_dict, "resolve"):
+            a_dict = a_dict.resolve()
+        old_url = str(a_dict.get("/URI", ""))
+        a_dict[pikepdf.Name("/URI")] = pikepdf.String(new_url)
+        pdf.save(output_path)
+
+    return {"success": True, "old_url": old_url, "new_url": new_url}
+
+
 def handle_replace_single(params):
     pdf_path = params["pdf_path"]
     search = params["search"]
@@ -276,6 +412,8 @@ METHODS = {
     "detect_paragraphs": handle_detect_paragraphs,
     "analyze_subset": handle_analyze_subset,
     "replace_single": handle_replace_single,
+    "inspect": handle_inspect,
+    "update_annotation": handle_update_annotation,
 }
 
 

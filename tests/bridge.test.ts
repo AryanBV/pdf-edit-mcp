@@ -8,6 +8,7 @@ import { existsSync, unlinkSync } from "node:fs";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BRIDGE_PATH = resolve(__dirname, "..", "bridge.py");
 const FIXTURE_PDF = resolve(__dirname, "fixtures", "reportlab_simple.pdf");
+const RESUME_PDF = resolve(__dirname, "fixtures", "resume_aryan.pdf");
 const PYTHON_CMD = process.env.PDF_EDIT_PYTHON || "C:/Python312/python.exe";
 
 interface JsonRpcResponse {
@@ -292,5 +293,109 @@ describe("bridge.py integration tests", () => {
     expect(res.error).toBeDefined();
     expect(res.error!.code).toBe(-32601);
     expect(res.error!.message).toContain("Method not found");
+  });
+
+  // ── inspect ─────────────────────────────────────────────────────
+
+  it("inspect returns text, fonts, paragraphs, and annotations", async () => {
+    const res = await call("inspect", { pdf_path: FIXTURE_PDF });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeDefined();
+    const result = res.result!;
+    expect(result.page_count).toBe(1);
+    expect(result.text).toContain("Test Document");
+    const fonts = result.fonts as Array<Record<string, unknown>>;
+    expect(fonts.length).toBeGreaterThanOrEqual(1);
+    expect(fonts[0].name).toBeTypeOf("string");
+    const paragraphs = result.paragraphs as Array<Record<string, unknown>>;
+    expect(paragraphs.length).toBeGreaterThanOrEqual(1);
+    expect(paragraphs[0].text).toBeTypeOf("string");
+    expect(result.annotations).toBeDefined();
+    expect(Array.isArray(result.annotations)).toBe(true);
+  });
+
+  it("inspect on PDF without annotations returns empty annotations array", async () => {
+    const res = await call("inspect", { pdf_path: FIXTURE_PDF });
+    expect(res.error).toBeUndefined();
+    const annotations = res.result!.annotations as Array<Record<string, unknown>>;
+    expect(annotations).toHaveLength(0);
+  });
+
+  it("inspect on resume PDF returns non-empty annotations", async () => {
+    const res = await call("inspect", { pdf_path: RESUME_PDF });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeDefined();
+    const annotations = res.result!.annotations as Array<Record<string, unknown>>;
+    expect(annotations.length).toBeGreaterThanOrEqual(1);
+    expect(annotations[0].subtype).toBeTypeOf("string");
+    expect(annotations[0].rect).toBeDefined();
+    expect(annotations[0].page).toBeTypeOf("number");
+  });
+
+  // ── update_annotation ───────────────────────────────────────────
+
+  it("update_annotation changes a URL and saves correctly", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_annot_output.pdf");
+    try {
+      // First inspect to find an annotation with a URL
+      const inspectRes = await call("inspect", { pdf_path: RESUME_PDF });
+      expect(inspectRes.error).toBeUndefined();
+      const annotations = inspectRes.result!.annotations as Array<Record<string, unknown>>;
+      const linkAnnot = annotations.find((a) => a.url !== undefined);
+      expect(linkAnnot).toBeDefined();
+
+      const res = await call("update_annotation", {
+        pdf_path: RESUME_PDF,
+        page: linkAnnot!.page as number,
+        annotation_index: linkAnnot!.index as number,
+        url: "https://example.com/updated",
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(res.result!.success).toBe(true);
+      expect(res.result!.new_url).toBe("https://example.com/updated");
+      expect(res.result!.old_url).toBeTypeOf("string");
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("update_annotation with invalid index returns error", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_annot_bad.pdf");
+    const res = await call("update_annotation", {
+      pdf_path: RESUME_PDF,
+      page: 0,
+      annotation_index: 999,
+      url: "https://example.com",
+      output_path: outputPath,
+    });
+    expect(res.error).toBeDefined();
+    expect(res.error!.code).toBe(-32000);
+    expect(res.error!.message).toContain("out of range");
+  });
+
+  // ── batch_replace verification ──────────────────────────────────
+
+  it("batch_replace includes verification data", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_batch_verify.pdf");
+    try {
+      const res = await call("batch_replace", {
+        pdf_path: FIXTURE_PDF,
+        edits: [
+          { find: "Test", replace: "Demo" },
+          { find: "simple", replace: "basic" },
+        ],
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      const verification = res.result!.verification as Record<string, unknown>;
+      expect(verification).toBeDefined();
+      expect(typeof verification.all_replacements_confirmed).toBe("boolean");
+      expect(verification.output_text_preview).toBeTypeOf("string");
+      expect(Array.isArray(verification.unconfirmed)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
   });
 });
