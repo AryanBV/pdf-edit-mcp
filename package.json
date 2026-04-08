@@ -1,0 +1,51 @@
+{
+  "name": "@aryanbv/pdf-edit-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for format-preserving PDF text editing — find, replace, and batch-edit text in existing PDFs while preserving fonts, layout, and visual fidelity.",
+  "type": "module",
+  "bin": {
+    "pdf-edit-mcp": "./dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "bridge.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "pdf",
+    "pdf-edit",
+    "pdf-replace",
+    "pdf-find",
+    "text-editing",
+    "format-preserving",
+    "model-context-protocol",
+    "claude",
+    "typescript",
+    "ai-tools"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.1.0"
+  }
+}

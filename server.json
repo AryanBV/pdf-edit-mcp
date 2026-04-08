@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AryanBV/pdf-edit-mcp",
+  "description": "Format-preserving PDF text editing — find, replace, batch-edit text while preserving fonts and layout.",
+  "repository": {
+    "url": "https://github.com/AryanBV/pdf-edit-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@aryanbv/pdf-edit-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

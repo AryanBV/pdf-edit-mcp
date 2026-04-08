@@ -1,0 +1,11 @@
+src/
+tests/
+tsconfig.json
+.git/
+.claude/
+.remember/
+node_modules/
+CLAUDE.md
+vitest.config.ts
+*.ts
+!dist/**/*.d.ts
