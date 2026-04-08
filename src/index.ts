@@ -17,6 +17,9 @@ import {
   replaceSingleInputSchema,
   inspectInputSchema,
   updateAnnotationInputSchema,
+  replaceBlockInputSchema,
+  insertTextBlockInputSchema,
+  deleteBlockInputSchema,
 } from "./schemas.js";
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -547,6 +550,144 @@ server.registerTool(
   }
 );
 
+// ── Tool: pdf_replace_block ─────────────────────────────────────────
+
+server.registerTool(
+  "pdf_replace_block",
+  {
+    description:
+      "Replace all content within a bounding box with new text. Use pdf_inspect or " +
+      "pdf_detect_paragraphs first to get bounding boxes. This is the PREFERRED tool " +
+      "for multi-line edits — it replaces by position, not by string matching, so it " +
+      "handles em dashes, ligatures, and line breaks correctly.",
+    inputSchema: replaceBlockInputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, page, bbox, new_text, output_path, font_name, font_size }) => {
+    try {
+      const warnings: string[] = [];
+      if (output_path === pdf_path) {
+        warnings.push(
+          "Warning: output_path is the same as pdf_path. The original file will be overwritten."
+        );
+      }
+      const params: Record<string, unknown> = {
+        pdf_path,
+        page,
+        bbox,
+        new_text,
+        output_path,
+      };
+      if (font_name !== undefined) params.font_name = font_name;
+      if (font_size !== undefined) params.font_size = font_size;
+      const result = await bridge.call("replace_block", params);
+      if (warnings.length > 0) {
+        const data = result as Record<string, unknown>;
+        data.warnings = warnings;
+      }
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── Tool: pdf_insert_text_block ────────────────────────────────────
+
+server.registerTool(
+  "pdf_insert_text_block",
+  {
+    description:
+      "Insert new text at a position and shift existing content down to make room. " +
+      "Use pdf_inspect to find the right coordinates. The font is auto-detected from " +
+      "the page. Use max_width to enable automatic text wrapping for multi-line content.",
+    inputSchema: insertTextBlockInputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, page, x, y, text, output_path, font_name, font_size, max_width }) => {
+    try {
+      const warnings: string[] = [];
+      if (output_path === pdf_path) {
+        warnings.push(
+          "Warning: output_path is the same as pdf_path. The original file will be overwritten."
+        );
+      }
+      const params: Record<string, unknown> = {
+        pdf_path,
+        page,
+        x,
+        y,
+        text,
+        output_path,
+      };
+      if (font_name !== undefined) params.font_name = font_name;
+      if (font_size !== undefined) params.font_size = font_size;
+      if (max_width !== undefined) params.max_width = max_width;
+      const result = await bridge.call("insert_text_block", params);
+      if (warnings.length > 0) {
+        const data = result as Record<string, unknown>;
+        data.warnings = warnings;
+      }
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── Tool: pdf_delete_block ─────────────────────────────────────────
+
+server.registerTool(
+  "pdf_delete_block",
+  {
+    description:
+      "Delete all content within a bounding box. When close_gap is true (default), " +
+      "content below shifts up to fill the space. Use pdf_inspect or " +
+      "pdf_detect_paragraphs to get bounding boxes.",
+    inputSchema: deleteBlockInputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, page, bbox, output_path, close_gap }) => {
+    try {
+      const warnings: string[] = [];
+      if (output_path === pdf_path) {
+        warnings.push(
+          "Warning: output_path is the same as pdf_path. The original file will be overwritten."
+        );
+      }
+      const result = await bridge.call("delete_block", {
+        pdf_path,
+        page,
+        bbox,
+        output_path,
+        close_gap,
+      });
+      if (warnings.length > 0) {
+        const data = result as Record<string, unknown>;
+        data.warnings = warnings;
+      }
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
 // ── MCP Prompts ─────────────────────────────────────────────────────
 
 server.registerPrompt(
@@ -572,7 +713,11 @@ server.registerPrompt(
             "Ask the user to confirm before proceeding.\n\n" +
             "STEP 3 — PRE-CHECK: For replacement text with unusual characters,\n" +
             "call pdf_analyze_subset to verify font support.\n\n" +
-            "STEP 4 — EXECUTE: Send ALL text edits in ONE pdf_batch_replace call.\n" +
+            "STEP 4 — EXECUTE:\n" +
+            "  For single-line text swaps (names, dates, titles): use pdf_batch_replace.\n" +
+            "  For multi-line paragraph rewrites: use pdf_replace_block with bbox from pdf_detect_paragraphs.\n" +
+            "  For adding new content: use pdf_insert_text_block at the target position.\n" +
+            "  For removing a section: use pdf_delete_block with the paragraph bbox.\n" +
             "Then update annotation URLs via pdf_update_annotation if needed.\n\n" +
             "STEP 5 — VERIFY: Check the verification data in the batch_replace response.\n" +
             "If any replacements are unconfirmed, call pdf_get_text on the output.\n\n" +

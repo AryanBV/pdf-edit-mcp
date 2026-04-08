@@ -168,3 +168,88 @@ export const updateAnnotationInputSchema = z
     output_path: outputPathSchema,
   })
   .strict();
+
+// ── Block operation schemas ─────────────────────────────────────────
+
+export const bboxSchema = z
+  .object({
+    x0: z.number().describe("Left edge x-coordinate"),
+    y0: z.number().describe("Bottom edge y-coordinate"),
+    x1: z.number().describe("Right edge x-coordinate"),
+    y1: z.number().describe("Top edge y-coordinate"),
+  })
+  .strict();
+
+export const replaceBlockInputSchema = z
+  .object({
+    pdf_path: pdfPathSchema,
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .describe("0-indexed page number"),
+    bbox: bboxSchema.describe("Bounding box of the block to replace"),
+    new_text: z
+      .string()
+      .min(1, "Replacement text must not be empty")
+      .describe("New text content for the block"),
+    output_path: outputPathSchema,
+    font_name: z
+      .string()
+      .optional()
+      .describe("Font name override (uses detected font if omitted)"),
+    font_size: z
+      .number()
+      .optional()
+      .describe("Font size override (uses detected size if omitted)"),
+  })
+  .strict();
+
+export const insertTextBlockInputSchema = z
+  .object({
+    pdf_path: pdfPathSchema,
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .describe("0-indexed page number"),
+    x: z.number().describe("X-coordinate for text insertion"),
+    y: z.number().describe("Y-coordinate for text insertion"),
+    text: z
+      .string()
+      .min(1, "Text must not be empty")
+      .describe("Text content to insert"),
+    output_path: outputPathSchema,
+    font_name: z
+      .string()
+      .optional()
+      .describe("Font name (uses default if omitted)"),
+    font_size: z
+      .number()
+      .optional()
+      .default(12.0)
+      .describe("Font size in points (default: 12)"),
+    max_width: z
+      .number()
+      .optional()
+      .describe("Maximum width for text wrapping (no wrapping if omitted)"),
+  })
+  .strict();
+
+export const deleteBlockInputSchema = z
+  .object({
+    pdf_path: pdfPathSchema,
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .describe("0-indexed page number"),
+    bbox: bboxSchema.describe("Bounding box of the block to delete"),
+    output_path: outputPathSchema,
+    close_gap: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Whether to close the gap left by deletion (default: true)"),
+  })
+  .strict();

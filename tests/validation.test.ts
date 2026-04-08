@@ -13,6 +13,10 @@ import {
   replaceSingleInputSchema,
   inspectInputSchema,
   updateAnnotationInputSchema,
+  bboxSchema,
+  replaceBlockInputSchema,
+  insertTextBlockInputSchema,
+  deleteBlockInputSchema,
 } from "../src/schemas.js";
 
 describe("Zod schema validation", () => {
@@ -358,6 +362,176 @@ describe("Zod schema validation", () => {
         annotation_index: 0,
         url: "https://example.com",
       });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── bboxSchema ──────────────────────────────────────────────────
+
+  describe("bboxSchema", () => {
+    it("accepts valid bbox", () => {
+      const result = bboxSchema.safeParse({ x0: 0, y0: 0, x1: 100, y1: 50 });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects missing field", () => {
+      const result = bboxSchema.safeParse({ x0: 0, y0: 0, x1: 100 });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects extra field (strict)", () => {
+      const result = bboxSchema.safeParse({ x0: 0, y0: 0, x1: 100, y1: 50, extra: 1 });
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts negative coordinates", () => {
+      const result = bboxSchema.safeParse({ x0: -10, y0: -20, x1: 100, y1: 50 });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects non-number values", () => {
+      const result = bboxSchema.safeParse({ x0: "0", y0: 0, x1: 100, y1: 50 });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── replaceBlockInputSchema ─────────────────────────────────────
+
+  describe("replaceBlockInputSchema", () => {
+    const validInput = {
+      pdf_path: "C:/docs/input.pdf",
+      page: 0,
+      bbox: { x0: 50, y0: 100, x1: 500, y1: 200 },
+      new_text: "Replacement paragraph",
+      output_path: "C:/docs/output.pdf",
+    };
+
+    it("accepts valid input", () => {
+      const result = replaceBlockInputSchema.safeParse(validInput);
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects missing bbox", () => {
+      const { bbox: _, ...rest } = validInput;
+      const result = replaceBlockInputSchema.safeParse(rest);
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects empty new_text", () => {
+      const result = replaceBlockInputSchema.safeParse({ ...validInput, new_text: "" });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects negative page", () => {
+      const result = replaceBlockInputSchema.safeParse({ ...validInput, page: -1 });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects non-integer page", () => {
+      const result = replaceBlockInputSchema.safeParse({ ...validInput, page: 1.5 });
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts optional font_name and font_size", () => {
+      const result = replaceBlockInputSchema.safeParse({
+        ...validInput,
+        font_name: "Helvetica",
+        font_size: 14,
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects extra properties (strict)", () => {
+      const result = replaceBlockInputSchema.safeParse({ ...validInput, extra: true });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── insertTextBlockInputSchema ──────────────────────────────────
+
+  describe("insertTextBlockInputSchema", () => {
+    const validInput = {
+      pdf_path: "C:/docs/input.pdf",
+      page: 0,
+      x: 72,
+      y: 700,
+      text: "New paragraph text",
+      output_path: "C:/docs/output.pdf",
+    };
+
+    it("accepts valid input", () => {
+      const result = insertTextBlockInputSchema.safeParse(validInput);
+      expect(result.success).toBe(true);
+    });
+
+    it("defaults font_size to 12", () => {
+      const result = insertTextBlockInputSchema.safeParse(validInput);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.font_size).toBe(12);
+      }
+    });
+
+    it("rejects empty text", () => {
+      const result = insertTextBlockInputSchema.safeParse({ ...validInput, text: "" });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects missing x coordinate", () => {
+      const { x: _, ...rest } = validInput;
+      const result = insertTextBlockInputSchema.safeParse(rest);
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts optional max_width", () => {
+      const result = insertTextBlockInputSchema.safeParse({ ...validInput, max_width: 400 });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects extra properties (strict)", () => {
+      const result = insertTextBlockInputSchema.safeParse({ ...validInput, extra: true });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── deleteBlockInputSchema ──────────────────────────────────────
+
+  describe("deleteBlockInputSchema", () => {
+    const validInput = {
+      pdf_path: "C:/docs/input.pdf",
+      page: 0,
+      bbox: { x0: 50, y0: 100, x1: 500, y1: 200 },
+      output_path: "C:/docs/output.pdf",
+    };
+
+    it("accepts valid input", () => {
+      const result = deleteBlockInputSchema.safeParse(validInput);
+      expect(result.success).toBe(true);
+    });
+
+    it("defaults close_gap to true", () => {
+      const result = deleteBlockInputSchema.safeParse(validInput);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.close_gap).toBe(true);
+      }
+    });
+
+    it("accepts explicit close_gap: false", () => {
+      const result = deleteBlockInputSchema.safeParse({ ...validInput, close_gap: false });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.close_gap).toBe(false);
+      }
+    });
+
+    it("rejects negative page", () => {
+      const result = deleteBlockInputSchema.safeParse({ ...validInput, page: -1 });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects extra properties (strict)", () => {
+      const result = deleteBlockInputSchema.safeParse({ ...validInput, extra: true });
       expect(result.success).toBe(false);
     });
   });

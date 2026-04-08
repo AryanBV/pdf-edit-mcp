@@ -398,4 +398,158 @@ describe("bridge.py integration tests", () => {
       if (existsSync(outputPath)) unlinkSync(outputPath);
     }
   });
+
+  // ── replace_block ──────────────────────────────────────────────
+
+  it("replace_block replaces content by bounding box", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_replace_block.pdf");
+    try {
+      // Get a paragraph bbox from detect_paragraphs
+      const detectRes = await call("detect_paragraphs", {
+        pdf_path: RESUME_PDF,
+        page: 0,
+      });
+      expect(detectRes.error).toBeUndefined();
+      const paragraphs = detectRes.result!.paragraphs as Array<Record<string, unknown>>;
+      expect(paragraphs.length).toBeGreaterThanOrEqual(1);
+      const bbox = paragraphs[0].bbox as Record<string, number>;
+
+      const res = await call("replace_block", {
+        pdf_path: RESUME_PDF,
+        page: 0,
+        bbox,
+        new_text: "REPLACED CONTENT",
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(res.result!.success).toBe(true);
+      expect(res.result!.font_action).toBeTypeOf("string");
+      const fidelity = res.result!.fidelity as Record<string, unknown>;
+      expect(typeof fidelity.font_preserved).toBe("boolean");
+      expect(typeof fidelity.overflow_detected).toBe("boolean");
+
+      // Verify the replacement text appears in output (may be line-wrapped)
+      const textRes = await call("get_text", { pdf_path: outputPath });
+      expect(textRes.error).toBeUndefined();
+      const outText = textRes.result!.text as string;
+      expect(outText).toContain("REPLACED");
+      expect(outText).toContain("CONTENT");
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  // ── insert_text_block ──────────────────────────────────────────
+
+  it("insert_text_block inserts text at position", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_insert_block.pdf");
+    try {
+      const res = await call("insert_text_block", {
+        pdf_path: RESUME_PDF,
+        page: 0,
+        x: 72,
+        y: 700,
+        text: "INSERTED TEXT BLOCK",
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(res.result!.success).toBe(true);
+      const fidelity = res.result!.fidelity as Record<string, unknown>;
+      expect(fidelity).toBeDefined();
+
+      // Verify the inserted text appears in output
+      const textRes = await call("get_text", { pdf_path: outputPath });
+      expect(textRes.error).toBeUndefined();
+      expect(textRes.result!.text).toContain("INSERTED TEXT BLOCK");
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  // ── delete_block ───────────────────────────────────────────────
+
+  it("delete_block removes content by bounding box", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_delete_block.pdf");
+    try {
+      // Get a paragraph bbox and its text
+      const detectRes = await call("detect_paragraphs", {
+        pdf_path: RESUME_PDF,
+        page: 0,
+      });
+      expect(detectRes.error).toBeUndefined();
+      const paragraphs = detectRes.result!.paragraphs as Array<Record<string, unknown>>;
+      expect(paragraphs.length).toBeGreaterThanOrEqual(1);
+      const targetParagraph = paragraphs[0];
+      const bbox = targetParagraph.bbox as Record<string, number>;
+      const originalText = (targetParagraph.text as string).slice(0, 30);
+
+      const res = await call("delete_block", {
+        pdf_path: RESUME_PDF,
+        page: 0,
+        bbox,
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(res.result!.success).toBe(true);
+
+      // Verify the text is gone from output
+      const textRes = await call("get_text", { pdf_path: outputPath });
+      expect(textRes.error).toBeUndefined();
+      expect(textRes.result!.text).not.toContain(originalText);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  // ── UTF-8 round-trip ──────────────────────────────────────────
+
+  it("UTF-8 em dash survives JSON-RPC round-trip", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_utf8_roundtrip.pdf");
+    try {
+      const res = await call("batch_replace", {
+        pdf_path: FIXTURE_PDF,
+        edits: [{ find: "Test", replace: "Test \u2014 Demo" }],
+        output_path: outputPath,
+      });
+      // Response arriving without crash proves UTF-8 stdout works
+      expect(res.error).toBeUndefined();
+      expect(res.result).toBeDefined();
+      const results = res.result!.results as Array<Record<string, unknown>>;
+      expect(results.length).toBeGreaterThanOrEqual(1);
+
+      // Verify em dash appears in the output text
+      const textRes = await call("get_text", { pdf_path: outputPath });
+      expect(textRes.error).toBeUndefined();
+      const text = textRes.result!.text as string;
+      expect(text).toContain("\u2014");
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  // ── Error recovery ────────────────────────────────────────────
+
+  it("replace_block with invalid bbox returns error, bridge survives", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_bad_bbox.pdf");
+    const res = await call("replace_block", {
+      pdf_path: RESUME_PDF,
+      page: 0,
+      bbox: { x0: 9999, y0: 9999, x1: 9999, y1: 9999 },
+      new_text: "Should fail",
+      output_path: outputPath,
+    });
+    // Should get an error or at least not crash
+    // The bridge might succeed with empty original_text or return an error
+    if (res.error) {
+      expect(res.error.code).toBeTypeOf("number");
+    }
+
+    // Verify bridge is still alive with a subsequent valid call
+    const textRes = await call("get_text", { pdf_path: FIXTURE_PDF });
+    expect(textRes.error).toBeUndefined();
+    expect(textRes.result!.text).toContain("Test Document");
+
+    // Cleanup in case the operation did produce a file
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+  });
 });

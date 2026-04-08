@@ -10,9 +10,11 @@ goes to stderr. Responses use _stdout.write() exclusively.
 
 import json
 import sys
+import io
 
-# Save original stdout BEFORE any imports that might print
-_stdout = sys.stdout
+# Wrap stdin/stdout in UTF-8 BEFORE saving references (Windows defaults to cp1252)
+sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
+_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stdout = sys.stderr  # Redirect accidental prints to stderr
 
 try:
@@ -29,6 +31,11 @@ try:
         Edit,
     )
     from pdf_edit_engine.errors import PDFEditError, FontNotFoundError
+    from pdf_edit_engine.structural import (
+        replace_block,
+        insert_text_block,
+        delete_block,
+    )
 except ImportError as e:
     print(
         json.dumps({"error": f"pdf-edit-engine not installed: {e}"}),
@@ -55,6 +62,24 @@ def respond_error(req_id, code, message):
     }
     _stdout.write(json.dumps(response) + "\n")
     _stdout.flush()
+
+
+def _serialize_edit_result(result):
+    """Convert an EditResult dataclass to a JSON-serializable dict."""
+    return {
+        "success": result.success,
+        "original_text": result.original_text,
+        "new_text": result.new_text,
+        "font_action": result.font_action,
+        "warnings": result.warnings,
+        "fidelity": {
+            "font_preserved": result.fidelity_report.font_preserved,
+            "font_substituted": result.fidelity_report.font_substituted,
+            "overflow_detected": result.fidelity_report.overflow_detected,
+            "reflow_applied": result.fidelity_report.reflow_applied,
+            "glyphs_missing": result.fidelity_report.glyphs_missing,
+        },
+    }
 
 
 # ── Method handlers ───────────────────────────────────────────────────
@@ -408,6 +433,56 @@ def handle_replace_single(params):
     }
 
 
+def handle_replace_block(params):
+    pdf_path = params["pdf_path"]
+    page = int(params["page"])
+    bbox = params["bbox"]
+    bbox_tuple = (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
+    new_text = params["new_text"]
+    output_path = params["output_path"]
+
+    kwargs = {}
+    if params.get("font_name") is not None:
+        kwargs["font_name"] = params["font_name"]
+    if params.get("font_size") is not None:
+        kwargs["font_size"] = params["font_size"]
+
+    result = replace_block(pdf_path, page, bbox_tuple, new_text, output_path, **kwargs)
+    return _serialize_edit_result(result)
+
+
+def handle_insert_text_block(params):
+    pdf_path = params["pdf_path"]
+    page = int(params["page"])
+    x = params["x"]
+    y = params["y"]
+    text = params["text"]
+    output_path = params["output_path"]
+
+    kwargs = {}
+    if params.get("font_name") is not None:
+        kwargs["font_name"] = params["font_name"]
+    if params.get("font_size") is not None:
+        kwargs["font_size"] = params["font_size"]
+    if params.get("max_width") is not None:
+        kwargs["max_width"] = params["max_width"]
+
+    result = insert_text_block(pdf_path, page, x, y, text, output_path, **kwargs)
+    return _serialize_edit_result(result)
+
+
+def handle_delete_block(params):
+    pdf_path = params["pdf_path"]
+    page = int(params["page"])
+    bbox = params["bbox"]
+    bbox_tuple = (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
+    output_path = params["output_path"]
+    close_gap = params.get("close_gap", True)
+
+    result = delete_block(pdf_path, page, bbox_tuple, output_path, close_gap=close_gap)
+    return _serialize_edit_result(result)
+
+
 # ── Dispatch table ────────────────────────────────────────────────────
 
 METHODS = {
@@ -421,6 +496,9 @@ METHODS = {
     "replace_single": handle_replace_single,
     "inspect": handle_inspect,
     "update_annotation": handle_update_annotation,
+    "replace_block": handle_replace_block,
+    "insert_text_block": handle_insert_text_block,
+    "delete_block": handle_delete_block,
 }
 
 
