@@ -35,6 +35,7 @@ try:
         replace_block,
         insert_text_block,
         delete_block,
+        batch_replace_block,
     )
 except ImportError as e:
     print(
@@ -471,6 +472,28 @@ def handle_insert_text_block(params):
     return _serialize_edit_result(result)
 
 
+def handle_batch_replace_block(params):
+    pdf_path = params["pdf_path"]
+    page_number = int(params["page_number"])
+    output_path = params["output_path"]
+
+    replacements = []
+    for r in params["replacements"]:
+        bbox = r["bbox"]
+        bbox_tuple = (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
+        replacements.append((bbox_tuple, r["new_text"]))
+
+    results = batch_replace_block(pdf_path, page_number, replacements, output_path)
+    return {
+        "results": [_serialize_edit_result(r) for r in results],
+        "summary": {
+            "total": len(results),
+            "succeeded": sum(1 for r in results if r.success),
+            "failed": sum(1 for r in results if not r.success),
+        },
+    }
+
+
 def handle_delete_block(params):
     pdf_path = params["pdf_path"]
     page = int(params["page"])
@@ -497,6 +520,7 @@ METHODS = {
     "inspect": handle_inspect,
     "update_annotation": handle_update_annotation,
     "replace_block": handle_replace_block,
+    "batch_replace_block": handle_batch_replace_block,
     "insert_text_block": handle_insert_text_block,
     "delete_block": handle_delete_block,
 }

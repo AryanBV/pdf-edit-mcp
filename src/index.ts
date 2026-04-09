@@ -20,6 +20,7 @@ import {
   replaceBlockInputSchema,
   insertTextBlockInputSchema,
   deleteBlockInputSchema,
+  batchReplaceBlockInputSchema,
 } from "./schemas.js";
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -559,7 +560,8 @@ server.registerTool(
       "Replace all content within a bounding box with new text. Use pdf_inspect or " +
       "pdf_detect_paragraphs first to get bounding boxes. This is the PREFERRED tool " +
       "for multi-line edits — it replaces by position, not by string matching, so it " +
-      "handles em dashes, ligatures, and line breaks correctly.",
+      "handles em dashes, ligatures, and line breaks correctly. If the replacement " +
+      "text overflows the bbox vertically, content below is automatically shifted down.",
     inputSchema: replaceBlockInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -586,6 +588,50 @@ server.registerTool(
       if (font_name !== undefined) params.font_name = font_name;
       if (font_size !== undefined) params.font_size = font_size;
       const result = await bridge.call("replace_block", params);
+      if (warnings.length > 0) {
+        const data = result as Record<string, unknown>;
+        data.warnings = warnings;
+      }
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── Tool: pdf_batch_replace_block ──────────────────────────────────
+
+server.registerTool(
+  "pdf_batch_replace_block",
+  {
+    description:
+      "Replace content in multiple bounding boxes in one atomic operation on a single page. " +
+      "Replacements are processed top-to-bottom with cumulative vertical shift tracking — " +
+      "if one replacement overflows its bbox, subsequent replacements auto-adjust. " +
+      "Use pdf_inspect or pdf_detect_paragraphs first to get bounding boxes. " +
+      "PREFERRED tool for section swaps or multi-block rewrites on the same page.",
+    inputSchema: batchReplaceBlockInputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, page_number, replacements, output_path }) => {
+    try {
+      const warnings: string[] = [];
+      if (output_path === pdf_path) {
+        warnings.push(
+          "Warning: output_path is the same as pdf_path. The original file will be overwritten."
+        );
+      }
+      const result = await bridge.call("batch_replace_block", {
+        pdf_path,
+        page_number,
+        replacements,
+        output_path,
+      });
       if (warnings.length > 0) {
         const data = result as Record<string, unknown>;
         data.warnings = warnings;
@@ -716,6 +762,9 @@ server.registerPrompt(
             "STEP 4 — EXECUTE:\n" +
             "  For single-line text swaps (names, dates, titles): use pdf_batch_replace.\n" +
             "  For multi-line paragraph rewrites: use pdf_replace_block with bbox from pdf_detect_paragraphs.\n" +
+            "    (Content below the bbox is auto-shifted when replacement text overflows.)\n" +
+            "  For swapping/rewriting multiple sections on the same page: use pdf_batch_replace_block\n" +
+            "    (handles cumulative vertical shift automatically across replacements).\n" +
             "  For adding new content: use pdf_insert_text_block at the target position.\n" +
             "  For removing a section: use pdf_delete_block with the paragraph bbox.\n" +
             "Then update annotation URLs via pdf_update_annotation if needed.\n\n" +

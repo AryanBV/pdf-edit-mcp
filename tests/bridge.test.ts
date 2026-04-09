@@ -439,6 +439,90 @@ describe("bridge.py integration tests", () => {
     }
   });
 
+  // ── batch_replace_block ────────────────────────────────────────
+
+  it("batch_replace_block replaces multiple bboxes on same page", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_batch_block.pdf");
+    try {
+      // Get two paragraph bboxes
+      const detectRes = await call("detect_paragraphs", {
+        pdf_path: RESUME_PDF,
+        page: 0,
+      });
+      expect(detectRes.error).toBeUndefined();
+      const paragraphs = detectRes.result!.paragraphs as Array<Record<string, unknown>>;
+      expect(paragraphs.length).toBeGreaterThanOrEqual(2);
+      const bbox1 = paragraphs[0].bbox as Record<string, number>;
+      const bbox2 = paragraphs[1].bbox as Record<string, number>;
+
+      const res = await call("batch_replace_block", {
+        pdf_path: RESUME_PDF,
+        page_number: 0,
+        replacements: [
+          { bbox: bbox1, new_text: "FIRST BLOCK REPLACED" },
+          { bbox: bbox2, new_text: "SECOND BLOCK REPLACED" },
+        ],
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(res.result).toBeDefined();
+
+      const results = res.result!.results as Array<Record<string, unknown>>;
+      expect(results).toHaveLength(2);
+      expect(results[0].success).toBe(true);
+      expect(results[1].success).toBe(true);
+
+      const summary = res.result!.summary as Record<string, number>;
+      expect(summary.total).toBe(2);
+      expect(summary.succeeded).toBe(2);
+      expect(summary.failed).toBe(0);
+
+      // Verify both replacements appear in output (text may be line-wrapped)
+      const textRes = await call("get_text", { pdf_path: outputPath });
+      expect(textRes.error).toBeUndefined();
+      const outText = textRes.result!.text as string;
+      expect(outText).toContain("FIRST");
+      expect(outText).toContain("SECOND");
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("batch_replace_block returns EditResult with fidelity data", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_batch_block_fidelity.pdf");
+    try {
+      const detectRes = await call("detect_paragraphs", {
+        pdf_path: RESUME_PDF,
+        page: 0,
+      });
+      expect(detectRes.error).toBeUndefined();
+      const paragraphs = detectRes.result!.paragraphs as Array<Record<string, unknown>>;
+      const bbox = paragraphs[0].bbox as Record<string, number>;
+
+      const res = await call("batch_replace_block", {
+        pdf_path: RESUME_PDF,
+        page_number: 0,
+        replacements: [{ bbox, new_text: "FIDELITY CHECK" }],
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+
+      const results = res.result!.results as Array<Record<string, unknown>>;
+      expect(results).toHaveLength(1);
+      const result = results[0];
+      expect(result.success).toBe(true);
+      expect(result.font_action).toBeTypeOf("string");
+      expect(result.original_text).toBeTypeOf("string");
+      expect(result.new_text).toBeTypeOf("string");
+      const fidelity = result.fidelity as Record<string, unknown>;
+      expect(typeof fidelity.font_preserved).toBe("boolean");
+      expect(typeof fidelity.overflow_detected).toBe("boolean");
+      expect(typeof fidelity.reflow_applied).toBe("boolean");
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
   // ── insert_text_block ──────────────────────────────────────────
 
   it("insert_text_block inserts text at position", async () => {

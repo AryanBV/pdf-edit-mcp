@@ -17,6 +17,8 @@ import {
   replaceBlockInputSchema,
   insertTextBlockInputSchema,
   deleteBlockInputSchema,
+  blockReplacementSchema,
+  batchReplaceBlockInputSchema,
 } from "../src/schemas.js";
 
 describe("Zod schema validation", () => {
@@ -490,6 +492,121 @@ describe("Zod schema validation", () => {
 
     it("rejects extra properties (strict)", () => {
       const result = insertTextBlockInputSchema.safeParse({ ...validInput, extra: true });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── blockReplacementSchema ─────────────────────────────────────
+
+  describe("blockReplacementSchema", () => {
+    it("accepts valid replacement", () => {
+      const result = blockReplacementSchema.safeParse({
+        bbox: { x0: 50, y0: 100, x1: 500, y1: 200 },
+        new_text: "Replacement text",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects empty new_text", () => {
+      const result = blockReplacementSchema.safeParse({
+        bbox: { x0: 50, y0: 100, x1: 500, y1: 200 },
+        new_text: "",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects missing bbox", () => {
+      const result = blockReplacementSchema.safeParse({
+        new_text: "Some text",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects extra properties (strict)", () => {
+      const result = blockReplacementSchema.safeParse({
+        bbox: { x0: 50, y0: 100, x1: 500, y1: 200 },
+        new_text: "Text",
+        extra: true,
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ── batchReplaceBlockInputSchema ──────────────────────────────
+
+  describe("batchReplaceBlockInputSchema", () => {
+    const validInput = {
+      pdf_path: "C:/docs/input.pdf",
+      page_number: 0,
+      replacements: [
+        {
+          bbox: { x0: 50, y0: 100, x1: 500, y1: 200 },
+          new_text: "First replacement",
+        },
+        {
+          bbox: { x0: 50, y0: 300, x1: 500, y1: 400 },
+          new_text: "Second replacement",
+        },
+      ],
+      output_path: "C:/docs/output.pdf",
+    };
+
+    it("accepts valid input with multiple replacements", () => {
+      const result = batchReplaceBlockInputSchema.safeParse(validInput);
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects empty replacements array", () => {
+      const result = batchReplaceBlockInputSchema.safeParse({
+        ...validInput,
+        replacements: [],
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects more than 50 replacements", () => {
+      const replacements = Array.from({ length: 51 }, (_, i) => ({
+        bbox: { x0: 0, y0: i * 10, x1: 100, y1: i * 10 + 10 },
+        new_text: `text${i}`,
+      }));
+      const result = batchReplaceBlockInputSchema.safeParse({
+        ...validInput,
+        replacements,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects negative page_number", () => {
+      const result = batchReplaceBlockInputSchema.safeParse({
+        ...validInput,
+        page_number: -1,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects non-integer page_number", () => {
+      const result = batchReplaceBlockInputSchema.safeParse({
+        ...validInput,
+        page_number: 1.5,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects extra properties (strict)", () => {
+      const result = batchReplaceBlockInputSchema.safeParse({
+        ...validInput,
+        extra: true,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects replacement with invalid bbox", () => {
+      const result = batchReplaceBlockInputSchema.safeParse({
+        ...validInput,
+        replacements: [
+          { bbox: { x0: 50, y0: 100, x1: 500 }, new_text: "Missing y1" },
+        ],
+      });
       expect(result.success).toBe(false);
     });
   });

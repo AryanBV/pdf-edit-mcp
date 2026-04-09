@@ -236,6 +236,34 @@ export const insertTextBlockInputSchema = z
   })
   .strict();
 
+/** A single replacement in a batch_replace_block call. */
+export const blockReplacementSchema = z
+  .object({
+    bbox: bboxSchema.describe("Bounding box of the block to replace"),
+    new_text: z
+      .string()
+      .min(1, "Replacement text must not be empty")
+      .describe("New text content for the block"),
+  })
+  .strict();
+
+export const batchReplaceBlockInputSchema = z
+  .object({
+    pdf_path: pdfPathSchema,
+    page_number: z
+      .number()
+      .int()
+      .min(0)
+      .describe("0-indexed page number"),
+    replacements: z
+      .array(blockReplacementSchema)
+      .min(1, "At least one replacement is required")
+      .max(50, "Maximum 50 replacements per batch")
+      .describe("Array of {bbox, new_text} replacements to apply"),
+    output_path: outputPathSchema,
+  })
+  .strict();
+
 export const deleteBlockInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
