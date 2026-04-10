@@ -323,6 +323,56 @@ export const extractBboxTextInputSchema = z
   })
   .strict();
 
+export const swapSectionsInputSchema = z
+  .object({
+    pdf_path: pdfPathSchema,
+    section_a: z
+      .string()
+      .min(1)
+      .describe(
+        "Name or partial name of the first section to swap (fuzzy matched against detected section titles)"
+      ),
+    section_b: z
+      .string()
+      .min(1)
+      .describe(
+        "Name or partial name of the second section to swap (fuzzy matched)"
+      ),
+    output_path: outputPathSchema,
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .default(0)
+      .describe("0-indexed page number (default: 0)"),
+  })
+  .strict();
+
+export const replaceSectionInputSchema = z
+  .object({
+    pdf_path: pdfPathSchema,
+    section: z
+      .string()
+      .min(1)
+      .describe(
+        "Name or partial name of the section to replace (fuzzy matched against detected section titles)"
+      ),
+    new_text: z
+      .string()
+      .min(1)
+      .describe("New text content for the section (replaces title, tech stack, bullets — everything)"),
+    output_path: outputPathSchema,
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .default(0)
+      .describe("0-indexed page number (default: 0)"),
+  })
+  .strict();
+
 export const detectSectionsInputSchema = z
   .object({
     pdf_path: pdfPathSchema,

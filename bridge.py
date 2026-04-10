@@ -727,6 +727,159 @@ def handle_detect_sections(params):
     }
 
 
+def handle_swap_sections(params):
+    """Swap two sections by name — detects structure, finds siblings, swaps."""
+    pdf_path = params["pdf_path"]
+    section_a = params["section_a"]
+    section_b = params["section_b"]
+    output_path = params["output_path"]
+    page = params.get("page", 0)
+
+    # Detect sections
+    det = handle_detect_sections({
+        "pdf_path": pdf_path, "page": page, "include_text": True,
+    })
+
+    # Flatten section tree
+    all_secs = []
+    for s in det["sections"]:
+        all_secs.append(s)
+        for c in s.get("children", []):
+            all_secs.append(c)
+
+    if not all_secs:
+        raise PDFEditError("No sections detected in the document")
+
+    # Fuzzy-match by title
+    def find_sec(name):
+        low = name.lower()
+        return next((s for s in all_secs if low in s["title"].lower()), None)
+
+    match_a = find_sec(section_a)
+    match_b = find_sec(section_b)
+    if not match_a:
+        titles = [s["title"][:40] for s in all_secs]
+        raise PDFEditError(f"Section '{section_a}' not found. Available: {titles}")
+    if not match_b:
+        titles = [s["title"][:40] for s in all_secs]
+        raise PDFEditError(f"Section '{section_b}' not found. Available: {titles}")
+    if match_a is match_b:
+        raise PDFEditError(f"Both names match the same section: '{match_a['title'][:50]}'")
+
+    # Find the nearest containing section (one level up) by bbox geometry
+    target_level = match_a["level"]
+    container = next(
+        (s for s in all_secs
+         if s["level"] == target_level - 1
+         and match_a["bbox"]["y0"] >= s["bbox"]["y0"]
+         and match_a["bbox"]["y1"] <= s["bbox"]["y1"]
+         and match_b["bbox"]["y0"] >= s["bbox"]["y0"]
+         and match_b["bbox"]["y1"] <= s["bbox"]["y1"]),
+        None,
+    )
+
+    # Siblings = same-level sections within the container's bbox
+    if container:
+        siblings = [
+            s for s in all_secs
+            if s["level"] == target_level
+            and s["bbox"]["y0"] >= container["bbox"]["y0"]
+            and s["bbox"]["y1"] <= container["bbox"]["y1"]
+        ]
+    else:
+        siblings = [s for s in all_secs if s["level"] == target_level]
+
+    # Build replacements: swap a↔b, keep rest unchanged
+    replacements = []
+    for sib in siblings:
+        if sib["title"] == match_a["title"]:
+            replacements.append({"bbox": sib["bbox"], "new_text": match_b["text"]})
+        elif sib["title"] == match_b["title"]:
+            replacements.append({"bbox": sib["bbox"], "new_text": match_a["text"]})
+        else:
+            replacements.append({"bbox": sib["bbox"], "new_text": sib["text"]})
+
+    result = handle_batch_replace_block({
+        "pdf_path": pdf_path, "page_number": page,
+        "replacements": replacements, "output_path": output_path,
+    })
+
+    return {
+        "success": all(r["success"] for r in result["results"]),
+        "swapped": [match_a["title"][:50], match_b["title"][:50]],
+        "siblings_rerendered": len(siblings),
+        "output_path": output_path,
+    }
+
+
+def handle_replace_section(params):
+    """Replace one section's content by name — re-renders all siblings."""
+    pdf_path = params["pdf_path"]
+    section_name = params["section"]
+    new_text = params["new_text"]
+    output_path = params["output_path"]
+    page = params.get("page", 0)
+
+    det = handle_detect_sections({
+        "pdf_path": pdf_path, "page": page, "include_text": True,
+    })
+
+    all_secs = []
+    for s in det["sections"]:
+        all_secs.append(s)
+        for c in s.get("children", []):
+            all_secs.append(c)
+
+    if not all_secs:
+        raise PDFEditError("No sections detected in the document")
+
+    low = section_name.lower()
+    match = next((s for s in all_secs if low in s["title"].lower()), None)
+    if not match:
+        titles = [s["title"][:40] for s in all_secs]
+        raise PDFEditError(f"Section '{section_name}' not found. Available: {titles}")
+
+    # Find the nearest containing section (one level up) by bbox geometry
+    target_level = match["level"]
+    container = next(
+        (s for s in all_secs
+         if s["level"] == target_level - 1
+         and match["bbox"]["y0"] >= s["bbox"]["y0"]
+         and match["bbox"]["y1"] <= s["bbox"]["y1"]),
+        None,
+    )
+
+    if container:
+        siblings = [
+            s for s in all_secs
+            if s["level"] == target_level
+            and s["bbox"]["y0"] >= container["bbox"]["y0"]
+            and s["bbox"]["y1"] <= container["bbox"]["y1"]
+        ]
+    else:
+        siblings = [s for s in all_secs if s["level"] == target_level]
+
+    # Build replacements: target gets new text, siblings keep original
+    replacements = []
+    for sib in siblings:
+        if sib["title"] == match["title"]:
+            replacements.append({"bbox": sib["bbox"], "new_text": new_text})
+        else:
+            replacements.append({"bbox": sib["bbox"], "new_text": sib["text"]})
+
+    result = handle_batch_replace_block({
+        "pdf_path": pdf_path, "page_number": page,
+        "replacements": replacements, "output_path": output_path,
+    })
+
+    return {
+        "success": all(r["success"] for r in result["results"]),
+        "replaced": match["title"][:50],
+        "siblings_rerendered": len(siblings),
+        "output_path": output_path,
+    }
+
+
 # ── Wrapper handlers (15 document operations) ────────────────────────
 
 def handle_merge(params):
@@ -931,6 +1084,8 @@ METHODS = {
     "get_text_layout": handle_get_text_layout,
     "extract_bbox_text": handle_extract_bbox_text,
     "detect_sections": handle_detect_sections,
+    "swap_sections": handle_swap_sections,
+    "replace_section": handle_replace_section,
     # Wrapper operations
     "merge": handle_merge,
     "split": handle_split,

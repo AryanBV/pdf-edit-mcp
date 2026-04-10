@@ -24,6 +24,8 @@ import {
   batchReplaceBlockInputSchema,
   getTextLayoutInputSchema,
   extractBboxTextInputSchema,
+  swapSectionsInputSchema,
+  replaceSectionInputSchema,
   detectSectionsInputSchema,
   mergeInputSchema,
   splitInputSchema,
@@ -299,8 +301,10 @@ server.registerTool(
   "pdf_replace_text",
   {
     description:
-      "Replace ALL occurrences of a search string. For edits involving 2+ changes " +
-      "(titles, descriptions, tech stacks), use pdf_batch_replace instead. " +
+      "Replace ALL occurrences of a text string — for simple changes like names, " +
+      "dates, typos, or labels. For 2+ related changes, use pdf_batch_replace. " +
+      "Do NOT use for swapping or rewriting entire sections — use " +
+      "pdf_swap_sections or pdf_replace_section instead. " +
       "Call pdf_inspect first to understand the document.",
     inputSchema: replaceTextInputSchema,
     annotations: {
@@ -342,9 +346,11 @@ server.registerTool(
   "pdf_batch_replace",
   {
     description:
-      "Apply multiple text replacements in one atomic operation. PREFERRED tool for any " +
-      "edit involving 2+ related changes — section rewrites, project swaps, template fills. " +
-      "Include ALL related changes in one call. Never split related edits across multiple calls.",
+      "Apply multiple find-and-replace text edits in one atomic operation. " +
+      "PREFERRED for 2+ simple text changes in one call — renaming, dates, labels, " +
+      "template fields. Do NOT use for swapping or rewriting entire sections — " +
+      "use pdf_swap_sections or pdf_replace_section instead. " +
+      "Include ALL related text changes in one call.",
     inputSchema: batchReplaceInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -383,7 +389,9 @@ server.registerTool(
   "pdf_get_fonts",
   {
     description:
-      "List fonts with encoding details. Use pdf_inspect for a combined view.",
+      "List fonts with full details — encoding type, glyph count, PostScript name, " +
+      "embedded type, subset status. Use pdf_inspect for a quick overview, this tool " +
+      "for detailed font analysis.",
     inputSchema: getFontsInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -408,7 +416,9 @@ server.registerTool(
   "pdf_detect_paragraphs",
   {
     description:
-      "Detect paragraph boundaries with bounding boxes. Use pdf_inspect for a combined view.",
+      "Detect paragraph boundaries with bounding boxes on a single page. " +
+      "Use pdf_inspect for a combined view across all pages, or this tool for " +
+      "lightweight single-page analysis.",
     inputSchema: detectParagraphsInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -419,10 +429,7 @@ server.registerTool(
   },
   async ({ pdf_path, page }) => {
     try {
-      const result = await bridge.call("detect_paragraphs", {
-        pdf_path,
-        page,
-      });
+      const result = await bridge.call("detect_paragraphs", { pdf_path, page });
       return toolSuccess(result);
     } catch (err) {
       return toolError(err instanceof Error ? err.message : String(err));
@@ -631,10 +638,10 @@ server.registerTool(
   {
     description:
       "Replace content in multiple bounding boxes in one atomic operation on a single page. " +
-      "Replacements are processed top-to-bottom with cumulative vertical shift tracking — " +
-      "if one replacement overflows its bbox, subsequent replacements auto-adjust. " +
-      "Use pdf_inspect or pdf_detect_paragraphs first to get bounding boxes. " +
-      "PREFERRED tool for section swaps or multi-block rewrites on the same page.",
+      "For section swaps use pdf_swap_sections instead (simpler). " +
+      "For rewriting one section use pdf_replace_section instead (simpler). " +
+      "Use this tool for advanced multi-block edits where you have explicit bboxes. " +
+      "Replacements are processed top-to-bottom with cumulative vertical shift tracking.",
     inputSchema: batchReplaceBlockInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -828,14 +835,13 @@ server.registerTool(
   "pdf_detect_sections",
   {
     description:
-      "Detect document sections by analyzing font hierarchy and spatial layout. " +
-      "Returns a tree of sections with titles, bounding boxes, and extracted text. " +
-      "Uses universal font-size-based detection — works on resumes, papers, legal " +
-      "docs, reports, or any document with consistent heading fonts. " +
-      "Level 0 = largest headings (top-level sections), Level 1+ = subsections. " +
-      "Use the returned bboxes and text directly with pdf_batch_replace_block " +
-      "for section swaps. If detection returns empty, fall back to " +
-      "pdf_get_text_layout for manual section identification.",
+      "Analyze document structure — returns a tree of sections with titles, " +
+      "bounding boxes, and extracted text. For swapping sections use " +
+      "pdf_swap_sections instead (simpler). For rewriting a section use " +
+      "pdf_replace_section instead (simpler). Use this tool when you need " +
+      "raw structural data for custom operations. Works on resumes, papers, " +
+      "legal docs, reports. Level 0 = top-level headings, Level 1+ = subsections. " +
+      "If empty, fall back to pdf_get_text_layout.",
     inputSchema: detectSectionsInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -850,6 +856,74 @@ server.registerTool(
         pdf_path,
         page,
         include_text,
+      });
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── Carpenter tools (high-level, intent-matching) ───────────────────
+
+server.registerTool(
+  "pdf_swap_sections",
+  {
+    description:
+      "Swap two document sections by name. Automatically detects section " +
+      "structure, identifies both sections by fuzzy title match, and swaps " +
+      "all content (titles, tech stacks, bullet points) between the two " +
+      "positions. All sibling sections are re-rendered for uniform spacing. " +
+      "Example: 'AJSP' matches 'AJSP Manager — Business Management System'.",
+    inputSchema: swapSectionsInputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, section_a, section_b, output_path, page }) => {
+    try {
+      const result = await bridge.call("swap_sections", {
+        pdf_path,
+        section_a,
+        section_b,
+        output_path,
+        page,
+      });
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+server.registerTool(
+  "pdf_replace_section",
+  {
+    description:
+      "Replace an entire document section's content by name. Automatically " +
+      "detects section structure, finds the section by fuzzy title match, " +
+      "and replaces all content (title, tech stack, bullets — everything) " +
+      "with the provided new text. All sibling sections are re-rendered for " +
+      "uniform spacing.",
+    inputSchema: replaceSectionInputSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, section, new_text, output_path, page }) => {
+    try {
+      const result = await bridge.call("replace_section", {
+        pdf_path,
+        section,
+        new_text,
+        output_path,
+        page,
       });
       return toolSuccess(result);
     } catch (err) {
