@@ -142,3 +142,5 @@ vite.config.ts.timestamp-*
 .claude/
 .remember/
 demo_output/
+__pycache__/
+tests/stress_output/
