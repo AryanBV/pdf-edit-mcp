@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -21,6 +22,28 @@ import {
   insertTextBlockInputSchema,
   deleteBlockInputSchema,
   batchReplaceBlockInputSchema,
+  getTextLayoutInputSchema,
+  extractBboxTextInputSchema,
+  detectSectionsInputSchema,
+  mergeInputSchema,
+  splitInputSchema,
+  reorderPagesInputSchema,
+  rotatePagesInputSchema,
+  deletePagesInputSchema,
+  cropPagesInputSchema,
+  editMetadataInputSchema,
+  addBookmarkInputSchema,
+  encryptInputSchema,
+  decryptInputSchema,
+  addHyperlinkInputSchema,
+  addHighlightInputSchema,
+  flattenAnnotationsInputSchema,
+  fillFormInputSchema,
+  addWatermarkInputSchema,
+  getAnnotationsInputSchema,
+  addAnnotationInputSchema,
+  deleteAnnotationInputSchema,
+  moveAnnotationInputSchema,
 } from "./schemas.js";
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -488,7 +511,9 @@ server.registerTool(
     description:
       "Get a complete overview of a PDF — text, fonts, paragraph structure, and " +
       "annotations (links, bookmarks). This should be your FIRST call before any " +
-      "editing operation. Returns everything needed to plan comprehensive edits.",
+      "editing operation. Returns everything needed to plan comprehensive edits. " +
+      "Set include_layout=true to also get raw text blocks with positions and fonts " +
+      "(useful for section detection and bbox computation).",
     inputSchema: inspectInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -497,9 +522,9 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path }) => {
+  async ({ pdf_path, include_layout }) => {
     try {
-      const result = await bridge.call("inspect", { pdf_path });
+      const result = await bridge.call("inspect", { pdf_path, include_layout });
       return toolSuccess(result);
     } catch (err) {
       return toolError(err instanceof Error ? err.message : String(err));
@@ -734,6 +759,330 @@ server.registerTool(
   }
 );
 
+// ── Tool: pdf_get_text_layout ──────────────────────────────────────
+
+server.registerTool(
+  "pdf_get_text_layout",
+  {
+    description:
+      "Get every text block on a page with its exact position, font, and size. " +
+      "Each block represents one text operator's output (TJ/Tj). Use this to " +
+      "identify section boundaries by font differences, compute bboxes for " +
+      "block operations, or understand the document's visual structure. " +
+      "For a pre-grouped view, use pdf_detect_paragraphs instead.",
+    inputSchema: getTextLayoutInputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, page }) => {
+    try {
+      const result = await bridge.call("get_text_layout", { pdf_path, page });
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── Tool: pdf_extract_bbox_text ───────────────────────────────────
+
+server.registerTool(
+  "pdf_extract_bbox_text",
+  {
+    description:
+      "Extract text from a bounding box region with gap-aware joining. " +
+      "Uses position analysis to avoid inserting spurious spaces (e.g., " +
+      "'monthly' stays 'monthly', not 'month ly'). Use tolerance=0 for " +
+      "exact bbox matching (recommended for section extraction), or " +
+      "tolerance=2+ for loose matching. Lines are separated by newlines.",
+    inputSchema: extractBboxTextInputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, bbox, page, tolerance }) => {
+    try {
+      const result = await bridge.call("extract_bbox_text", {
+        pdf_path,
+        bbox,
+        page,
+        tolerance,
+      });
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── Tool: pdf_detect_sections ─────────────────────────────────────
+
+server.registerTool(
+  "pdf_detect_sections",
+  {
+    description:
+      "Detect document sections by analyzing font hierarchy and spatial layout. " +
+      "Returns a tree of sections with titles, bounding boxes, and extracted text. " +
+      "Uses universal font-size-based detection — works on resumes, papers, legal " +
+      "docs, reports, or any document with consistent heading fonts. " +
+      "Level 0 = largest headings (top-level sections), Level 1+ = subsections. " +
+      "Use the returned bboxes and text directly with pdf_batch_replace_block " +
+      "for section swaps. If detection returns empty, fall back to " +
+      "pdf_get_text_layout for manual section identification.",
+    inputSchema: detectSectionsInputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, page, include_text }) => {
+    try {
+      const result = await bridge.call("detect_sections", {
+        pdf_path,
+        page,
+        include_text,
+      });
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+// ── Wrapper tools (document operations) ─────────────────────────────
+
+// Helper for simple write tools that follow the same bridge-call pattern.
+// Uses `as never` cast because server.registerTool's strict type inference
+// doesn't propagate through generic wrappers — runtime types are correct.
+function registerWriteTool(
+  name: string,
+  desc: string,
+  schema: z.ZodType,
+  bridgeMethod: string,
+  paramsFn: (args: Record<string, unknown>) => Record<string, unknown>
+) {
+  (server.registerTool as Function)(
+    name,
+    {
+      description: desc,
+      inputSchema: schema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        const result = await bridge.call(bridgeMethod, paramsFn(args));
+        return toolSuccess(result);
+      } catch (err) {
+        return toolError(err instanceof Error ? err.message : String(err));
+      }
+    }
+  );
+}
+
+registerWriteTool(
+  "pdf_merge",
+  "Merge multiple PDFs into a single document. Pages are appended in order.",
+  mergeInputSchema,
+  "merge",
+  (a) => ({ pdf_paths: a.pdf_paths, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_split",
+  "Split a PDF into individual page files. Each page becomes a separate PDF in the output directory.",
+  splitInputSchema,
+  "split",
+  (a) => ({ pdf_path: a.pdf_path, output_dir: a.output_dir })
+);
+
+registerWriteTool(
+  "pdf_reorder_pages",
+  "Reorder pages in a PDF. Provide the new page order as 0-indexed page numbers.",
+  reorderPagesInputSchema,
+  "reorder_pages",
+  (a) => ({ pdf_path: a.pdf_path, page_order: a.page_order, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_rotate_pages",
+  "Rotate specified pages by 90, 180, or 270 degrees.",
+  rotatePagesInputSchema,
+  "rotate_pages",
+  (a) => ({ pdf_path: a.pdf_path, pages: a.pages, angle: a.angle, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_delete_pages",
+  "Delete specified pages from a PDF. Pages are 0-indexed.",
+  deletePagesInputSchema,
+  "delete_pages",
+  (a) => ({ pdf_path: a.pdf_path, pages: a.pages, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_crop_pages",
+  "Crop all pages to the specified bounding box. Coordinates in PDF points.",
+  cropPagesInputSchema,
+  "crop_pages",
+  (a) => ({ pdf_path: a.pdf_path, box: a.box, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_edit_metadata",
+  "Edit PDF document metadata. Common fields: title, author, subject, creator, producer.",
+  editMetadataInputSchema,
+  "edit_metadata",
+  (a) => ({ pdf_path: a.pdf_path, metadata: a.metadata, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_add_bookmark",
+  "Add a bookmark (outline/navigation entry) pointing to a specific page.",
+  addBookmarkInputSchema,
+  "add_bookmark",
+  (a) => ({ pdf_path: a.pdf_path, title: a.title, page: a.page, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_encrypt",
+  "Encrypt a PDF with owner and user passwords. Owner password controls permissions, user password controls access.",
+  encryptInputSchema,
+  "encrypt",
+  (a) => ({
+    pdf_path: a.pdf_path,
+    owner_password: a.owner_password,
+    user_password: a.user_password,
+    output_path: a.output_path,
+  })
+);
+
+registerWriteTool(
+  "pdf_decrypt",
+  "Decrypt a password-protected PDF.",
+  decryptInputSchema,
+  "decrypt",
+  (a) => ({ pdf_path: a.pdf_path, password: a.password, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_add_hyperlink",
+  "Add a clickable hyperlink annotation to a page region. Use pdf_inspect to find coordinates.",
+  addHyperlinkInputSchema,
+  "add_hyperlink",
+  (a) => ({
+    pdf_path: a.pdf_path, page: a.page, bbox: a.bbox, uri: a.uri, output_path: a.output_path,
+  })
+);
+
+registerWriteTool(
+  "pdf_add_highlight",
+  "Add a highlight annotation. Provide QuadPoints (8 floats per highlighted region).",
+  addHighlightInputSchema,
+  "add_highlight",
+  (a) => ({
+    pdf_path: a.pdf_path, page: a.page, quad_points: a.quad_points, output_path: a.output_path,
+  })
+);
+
+registerWriteTool(
+  "pdf_flatten_annotations",
+  "Flatten all annotations into page content. Annotations become non-editable.",
+  flattenAnnotationsInputSchema,
+  "flatten_annotations",
+  (a) => ({ pdf_path: a.pdf_path, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_fill_form",
+  "Fill form fields in a PDF. Provide field names and values as key-value pairs.",
+  fillFormInputSchema,
+  "fill_form",
+  (a) => ({ pdf_path: a.pdf_path, field_values: a.field_values, output_path: a.output_path })
+);
+
+registerWriteTool(
+  "pdf_add_watermark",
+  "Add a watermark from another PDF to all pages. The watermark PDF's first page is overlaid.",
+  addWatermarkInputSchema,
+  "add_watermark",
+  (a) => ({ pdf_path: a.pdf_path, watermark_path: a.watermark_path, output_path: a.output_path })
+);
+
+// ── Annotation tools (engine API) ───────────────────────────────────
+
+server.registerTool(
+  "pdf_get_annotations",
+  {
+    description:
+      "List all annotations in a PDF with their positions, types, and URLs. " +
+      "Optionally filter by page. Use this instead of pdf_inspect when you " +
+      "only need annotation data.",
+    inputSchema: getAnnotationsInputSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ pdf_path, page }) => {
+    try {
+      const result = await bridge.call("get_annotations", { pdf_path, page });
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }
+);
+
+registerWriteTool(
+  "pdf_add_annotation",
+  "Add a link annotation at a specific position on a page.",
+  addAnnotationInputSchema,
+  "add_annotation",
+  (a) => ({
+    pdf_path: a.pdf_path, page: a.page, rect: a.rect, uri: a.uri,
+    output_path: a.output_path, border_style: a.border_style,
+  })
+);
+
+registerWriteTool(
+  "pdf_delete_annotation_v2",
+  "Delete an annotation by page and index. Use pdf_get_annotations to find indices. " +
+    "This replaces the older pdf_update_annotation approach for deletions.",
+  deleteAnnotationInputSchema,
+  "delete_annotation_v2",
+  (a) => ({
+    pdf_path: a.pdf_path, page: a.page, annotation_index: a.annotation_index,
+    output_path: a.output_path,
+  })
+);
+
+registerWriteTool(
+  "pdf_move_annotation",
+  "Move an annotation to a new position. Use pdf_get_annotations to find the annotation index.",
+  moveAnnotationInputSchema,
+  "move_annotation",
+  (a) => ({
+    pdf_path: a.pdf_path, page: a.page, annotation_index: a.annotation_index,
+    new_rect: a.new_rect, output_path: a.output_path,
+  })
+);
+
 // ── MCP Prompts ─────────────────────────────────────────────────────
 
 server.registerPrompt(
@@ -750,32 +1099,82 @@ server.registerPrompt(
           type: "text" as const,
           text:
             "When editing a PDF document, follow this workflow:\n\n" +
-            "STEP 1 — READ: Call pdf_inspect to get the full document overview.\n" +
-            "Summarize sections, headings, content blocks, fonts, and links.\n\n" +
-            "STEP 2 — PLAN: Identify EVERY text change needed. Present as a table:\n" +
-            "| # | Current text (first 60 chars) | Replacement text | Section |\n" +
-            "Include titles, subtitles, tech stacks, descriptions, bullet points.\n" +
-            "List link URL updates separately.\n" +
-            "Ask the user to confirm before proceeding.\n\n" +
-            "STEP 3 — PRE-CHECK: For replacement text with unusual characters,\n" +
-            "call pdf_analyze_subset to verify font support.\n\n" +
-            "STEP 4 — EXECUTE:\n" +
-            "  For single-line text swaps (names, dates, titles): use pdf_batch_replace.\n" +
-            "  For multi-line paragraph rewrites: use pdf_replace_block with bbox from pdf_detect_paragraphs.\n" +
-            "    (Content below the bbox is auto-shifted when replacement text overflows.)\n" +
-            "  For swapping/rewriting multiple sections on the same page: use pdf_batch_replace_block\n" +
-            "    (handles cumulative vertical shift automatically across replacements).\n" +
-            "  For adding new content: use pdf_insert_text_block at the target position.\n" +
-            "  For removing a section: use pdf_delete_block with the paragraph bbox.\n" +
-            "Then update annotation URLs via pdf_update_annotation if needed.\n\n" +
-            "STEP 5 — VERIFY: Check the verification data in the batch_replace response.\n" +
-            "If any replacements are unconfirmed, call pdf_get_text on the output.\n\n" +
+            "STEP 1 — INSPECT\n" +
+            "Call pdf_inspect to get the full document overview (text, fonts,\n" +
+            "paragraphs, annotations). Read the full text to understand the document.\n\n" +
+            "STEP 2 — UNDERSTAND STRUCTURE\n" +
+            "For section-level operations (swap, move, replace titled sections):\n" +
+            "  → Call pdf_detect_sections for a structured section tree with bboxes and text.\n" +
+            "  → Sections are grouped by font hierarchy (level 0 = largest headings).\n" +
+            "For specific text positions:\n" +
+            "  → Call pdf_get_text_layout for individual blocks with font/position data.\n" +
+            "For simple text replacement:\n" +
+            "  → Call pdf_find_text to locate all occurrences.\n\n" +
+            "STEP 3 — PRE-CHECK\n" +
+            "If replacement text has unusual characters (bullets •, em-dashes —, non-Latin):\n" +
+            "  → Call pdf_analyze_subset to verify font support.\n\n" +
+            "STEP 4 — EXECUTE\n" +
+            "Section swaps/rewrites:\n" +
+            "  Use pdf_batch_replace_block with ALL sibling sections at the same level.\n" +
+            "  Include unchanged siblings with their original text for uniform spacing.\n" +
+            "  Do NOT pass line_height or section_gap — the engine auto-detects.\n" +
+            "Single block edits:\n" +
+            "  Use pdf_replace_block with the section's bbox.\n" +
+            "Text find-and-replace:\n" +
+            "  Use pdf_batch_replace for 2+ related changes (preferred).\n" +
+            "  Use pdf_replace_text for global search-replace.\n" +
+            "Adding new content:\n" +
+            "  Use pdf_insert_text_block at the target position.\n" +
+            "Removing a section:\n" +
+            "  Use pdf_delete_block with the section's bbox.\n" +
+            "Then: pdf_update_annotation if link URLs changed.\n\n" +
+            "STEP 5 — VERIFY\n" +
+            "Call pdf_get_text on the output PDF. Check for:\n" +
+            "  - No duplicate headers or content\n" +
+            "  - No missing sections\n" +
+            "  - No spurious spaces ('month ly', 'full - stack')\n" +
+            "  - All replacement text appears in expected regions\n\n" +
+            "FALLBACK — If pdf_detect_sections returns empty or unexpected results:\n" +
+            "  1. Call pdf_get_text_layout for raw block data\n" +
+            "  2. Identify heading blocks by font (bold font at left margin)\n" +
+            "  3. Compute bboxes: y1 = title_y + font_size + 0.5, y0 = next_title_y + size + 0.5\n" +
+            "  4. Extract text via pdf_extract_bbox_text(tolerance=0)\n" +
+            "  5. Proceed with pdf_batch_replace_block\n\n" +
             "RULES:\n" +
-            '- "Swap" or "replace" a section means ALL its content — title, subtitle,\n' +
-            "  tech stack, every bullet point, links.\n" +
-            "- Never edit without completing Steps 1-2 first.\n" +
-            "- Never execute without user confirmation.\n" +
-            "- Keep replacement text similar in length to original when possible.",
+            '- "Swap" a section means ALL its content — title, tech stack, every bullet.\n' +
+            "- When swapping, replace ALL sibling sections (not just the two being swapped).\n" +
+            "- Never pass line_height or section_gap to batch_replace_block unless asked.\n" +
+            "- Do text edits BEFORE annotation edits (text edits may shift indices).",
+        },
+      },
+    ],
+  })
+);
+
+server.registerPrompt(
+  "section-swap",
+  {
+    description:
+      "Swap two sections in a PDF by name — detects structure and handles all siblings",
+  },
+  async () => ({
+    messages: [
+      {
+        role: "user" as const,
+        content: {
+          type: "text" as const,
+          text:
+            "Swapping sections in a PDF:\n\n" +
+            "1. Call pdf_detect_sections(pdf_path, page) to get the section tree.\n" +
+            "2. Find the two sections to swap by matching titles (fuzzy match OK).\n" +
+            "3. Identify ALL sibling sections at the same level under the same parent.\n" +
+            "4. Call pdf_batch_replace_block with ALL siblings:\n" +
+            "   - Swapped sections get each other's text.\n" +
+            "   - Unchanged siblings get their original text (re-rendered for uniform spacing).\n" +
+            "   - Do NOT pass line_height or section_gap.\n" +
+            "5. Verify with pdf_get_text on the output — check no duplication, no missing content.\n\n" +
+            "IMPORTANT: Always include ALL siblings, not just the two being swapped.\n" +
+            "This ensures uniform spacing across the entire parent section.",
         },
       },
     ],

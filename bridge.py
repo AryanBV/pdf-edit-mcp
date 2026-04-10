@@ -23,7 +23,9 @@ try:
         find,
         replace,
         get_text,
+        get_text_layout,
         get_fonts,
+        extract_bbox_text,
         replace_all,
         batch_replace,
         detect_paragraphs,
@@ -36,6 +38,31 @@ try:
         insert_text_block,
         delete_block,
         batch_replace_block,
+    )
+    from pdf_edit_engine.wrapper import (
+        merge_pdfs,
+        split_pdf,
+        reorder_pages,
+        rotate_pages,
+        delete_pages,
+        crop_pages,
+        edit_metadata,
+        add_bookmark,
+        encrypt_pdf,
+        decrypt_pdf,
+        add_hyperlink,
+        add_highlight,
+        flatten_annotations,
+        fill_form,
+        add_watermark,
+    )
+    from pdf_edit_engine.annotations import (
+        get_annotations,
+        add_annotation,
+        update_annotation_uri,
+        delete_annotation as engine_delete_annotation,
+        move_annotation,
+        Annotation,
     )
 except ImportError as e:
     print(
@@ -282,12 +309,13 @@ def handle_analyze_subset(params):
 
 def handle_inspect(params):
     pdf_path = params["pdf_path"]
+    include_layout = params.get("include_layout", False)
 
     # Reuse existing engine functions
     text = get_text(pdf_path)
     fonts_raw = get_fonts(pdf_path)
 
-    # Serialize fonts (same pattern as handle_get_fonts)
+    # Serialize fonts (slim: name, encoding, is_subset)
     fonts = [
         {
             "name": f.name,
@@ -297,8 +325,7 @@ def handle_inspect(params):
         for f in fonts_raw
     ]
 
-    # Extract annotations via pikepdf and get page_count
-    annotations = []
+    # Get page count
     with pikepdf.open(pdf_path) as pdf:
         page_count = len(pdf.pages)
 
@@ -309,7 +336,7 @@ def handle_inspect(params):
         try:
             page_paragraphs = detect_paragraphs(pdf_path, page=page_idx)
         except Exception:
-            continue  # Skip pages that fail (e.g., empty pages)
+            continue
         for p in page_paragraphs:
             paragraphs.append({
                 "text": p.full_text,
@@ -324,45 +351,57 @@ def handle_inspect(params):
                 "page": page_idx,
             })
 
-    # Extract annotations via pikepdf
-    with pikepdf.open(pdf_path) as pdf:
-        for page_idx, page in enumerate(pdf.pages):
-            annots = page.get("/Annots")
-            if annots is None:
-                continue
-            for ann_idx, annot_ref in enumerate(annots):
-                annot = annot_ref
-                if hasattr(annot, "resolve"):
-                    annot = annot.resolve()
-                subtype = str(annot.get("/Subtype", ""))
-                # Clean pikepdf Name prefix
-                if subtype.startswith("/"):
-                    subtype = subtype[1:]
-                rect = [float(x) for x in annot.get("/Rect", [])]
-                entry = {
-                    "index": ann_idx,
-                    "subtype": subtype,
-                    "rect": rect,
-                    "page": page_idx,
-                }
-                # Extract URL for Link annotations
-                if subtype == "Link":
-                    a_dict = annot.get("/A")
-                    if a_dict is not None:
-                        if hasattr(a_dict, "resolve"):
-                            a_dict = a_dict.resolve()
-                        uri = str(a_dict.get("/URI", ""))
-                        if uri:
-                            entry["url"] = uri
-                annotations.append(entry)
+    # Annotations via engine API (not pikepdf directly)
+    annots_raw = get_annotations(pdf_path)
+    annotations = []
+    for a in annots_raw:
+        entry = {
+            "index": a.index,
+            "subtype": a.subtype,
+            "rect": {
+                "x0": a.rect[0], "y0": a.rect[1],
+                "x1": a.rect[2], "y1": a.rect[3],
+            },
+            "page": a.page,
+        }
+        # Backward compat: Link annotations expose 'url' (old) + 'uri' (new)
+        if a.uri:
+            entry["url"] = a.uri
+            entry["uri"] = a.uri
+        if a.text:
+            entry["text"] = a.text
+        annotations.append(entry)
 
-    return {
+    result = {
         "page_count": page_count,
         "text": text,
         "fonts": fonts,
         "paragraphs": paragraphs,
         "annotations": annotations,
     }
+
+    # Optional: include raw text layout blocks
+    if include_layout:
+        layout = []
+        for page_idx in range(max_pages):
+            try:
+                blocks = get_text_layout(pdf_path, page=page_idx)
+            except Exception:
+                continue
+            for b in blocks:
+                layout.append({
+                    "text": b.text,
+                    "x": b.x,
+                    "y": b.y,
+                    "width": b.width,
+                    "height": b.height,
+                    "font_name": b.font_name,
+                    "font_size": b.font_size,
+                    "page": b.page,
+                })
+        result["text_layout"] = layout
+
+    return result
 
 
 def handle_update_annotation(params):
@@ -506,6 +545,372 @@ def handle_delete_block(params):
     return _serialize_edit_result(result)
 
 
+def handle_get_text_layout(params):
+    pdf_path = params["pdf_path"]
+    page = params.get("page", 0)
+    blocks = get_text_layout(pdf_path, page=page)
+    return {
+        "blocks": [
+            {
+                "text": b.text,
+                "x": b.x,
+                "y": b.y,
+                "width": b.width,
+                "height": b.height,
+                "font_name": b.font_name,
+                "font_size": b.font_size,
+                "page": b.page,
+            }
+            for b in blocks
+        ]
+    }
+
+
+def handle_extract_bbox_text(params):
+    pdf_path = params["pdf_path"]
+    bbox = params["bbox"]
+    bbox_tuple = (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
+    page = int(params["page"])
+    tolerance = params.get("tolerance", 0.0)
+    text = extract_bbox_text(pdf_path, bbox=bbox_tuple, page=page, tolerance=tolerance)
+    return {"text": text}
+
+
+def handle_detect_sections(params):
+    """Universal section detection via font hierarchy — no text patterns."""
+    from collections import Counter
+
+    pdf_path = params["pdf_path"]
+    page = params.get("page", 0)
+    include_text = params.get("include_text", True)
+
+    blocks = get_text_layout(pdf_path, page=page)
+    all_visible = [b for b in blocks if b.text.strip()]
+    if not all_visible:
+        return {"sections": [], "body_font": None, "heading_fonts": []}
+
+    # For font frequency, only count multi-char blocks (skip markers like • —)
+    multi_char = [b for b in all_visible if len(b.text.strip()) > 1]
+    if not multi_char:
+        return {"sections": [], "body_font": None, "heading_fonts": []}
+
+    # ── Step 1: Identify font hierarchy from frequency ───────────
+    font_freq = Counter(
+        (b.font_name, round(b.font_size, 1)) for b in multi_char
+    )
+    body_font, body_size = font_freq.most_common(1)[0][0]
+
+    # Heading = non-body font names (or same font at different size)
+    heading_font_names = {
+        fn for fn, fs in font_freq if fn != body_font
+    }
+    # Fallback: single-font doc, use size differences
+    if not heading_font_names:
+        sizes = sorted(set(round(b.font_size, 1) for b in multi_char), reverse=True)
+        if len(sizes) > 1:
+            heading_font_names = {body_font}
+        else:
+            return {"sections": [], "body_font": body_font, "heading_fonts": []}
+
+    page_x0 = min(b.x for b in all_visible)
+    page_x1 = max(b.x + b.width for b in all_visible)
+    MARGIN_TOL = 5.0
+
+    # ── Step 2: Group heading-font blocks into visual lines ──────
+    # Use all_visible (including single-char blocks) for title joining
+    lines_by_y = {}
+    for b in all_visible:
+        if b.font_name in heading_font_names:
+            y_key = round(b.y * 2) / 2
+            lines_by_y.setdefault(y_key, []).append(b)
+
+    heading_lines = []
+    for y_key in sorted(lines_by_y.keys(), reverse=True):
+        line_blocks = sorted(lines_by_y[y_key], key=lambda b: b.x)
+        # Check margin using first multi-char block (skip lone markers)
+        first_sig = next((b for b in line_blocks if len(b.text.strip()) > 1), None)
+        if first_sig is None:
+            continue
+        if abs(first_sig.x - page_x0) > MARGIN_TOL:
+            continue
+        joined = "".join(b.text for b in line_blocks).strip()
+        if not joined:
+            continue
+        font_size = round(line_blocks[0].font_size, 1)
+        # Skip if this is body-font at body-size (only relevant in
+        # single-font fallback where heading_font_names == {body_font}).
+        # Use first multi-char block for font classification.
+        sig_blocks = [b for b in line_blocks if len(b.text.strip()) > 1]
+        if not sig_blocks:
+            continue
+        if sig_blocks[0].font_name == body_font and font_size <= body_size:
+            continue
+        heading_lines.append({
+            "y": y_key, "title": joined,
+            "font_name": line_blocks[0].font_name,
+            "font_size": font_size,
+        })
+
+    if not heading_lines:
+        return {
+            "sections": [],
+            "body_font": body_font,
+            "heading_fonts": list(heading_font_names),
+        }
+
+    # ── Step 3: Assign hierarchy levels by font size ─────────────
+    distinct_sizes = sorted(
+        set(h["font_size"] for h in heading_lines), reverse=True
+    )
+    size_to_level = {s: i for i, s in enumerate(distinct_sizes)}
+    for h in heading_lines:
+        h["level"] = size_to_level[h["font_size"]]
+
+    # ── Step 4: Build tree + compute bboxes ──────────────────────
+    # Bbox rules:
+    #   y1 (top) = heading_y + font_size + 0.5
+    #   y0 (bottom) = next same-or-higher-level heading's (y + font_size + 0.5)
+    #   If last section, y0 = minimum y of any visible block on page
+    #   x0/x1 = page-wide
+    page_bottom = min(b.y for b in all_visible) - 1.0
+
+    sections = []
+    for i, h in enumerate(heading_lines):
+        y1 = h["y"] + h["font_size"] + 0.5
+        # Find next heading at same or higher (lower number) level
+        y0 = page_bottom
+        for j in range(i + 1, len(heading_lines)):
+            if heading_lines[j]["level"] <= h["level"]:
+                nxt = heading_lines[j]
+                y0 = nxt["y"] + nxt["font_size"] + 0.5
+                break
+
+        bbox = {"x0": page_x0, "y0": y0, "x1": page_x1, "y1": y1}
+
+        section = {
+            "title": h["title"],
+            "level": h["level"],
+            "bbox": bbox,
+            "font_name": h["font_name"],
+            "font_size": h["font_size"],
+            "page": page,
+        }
+
+        if include_text:
+            try:
+                section["text"] = extract_bbox_text(
+                    pdf_path,
+                    bbox=(bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"]),
+                    page=page,
+                    tolerance=0,
+                )
+            except Exception:
+                section["text"] = ""
+
+        sections.append(section)
+
+    # ── Step 5: Nest children under parents ──────────────────────
+    # Level 0 sections contain level 1+ sections whose bbox is inside
+    top_level = [s for s in sections if s["level"] == 0]
+    for parent in top_level:
+        parent["children"] = [
+            s for s in sections
+            if s["level"] > parent["level"]
+            and s["bbox"]["y0"] >= parent["bbox"]["y0"]
+            and s["bbox"]["y1"] <= parent["bbox"]["y1"]
+        ]
+
+    return {
+        "sections": top_level if top_level else sections,
+        "body_font": body_font,
+        "heading_fonts": list(heading_font_names),
+    }
+
+
+# ── Wrapper handlers (15 document operations) ────────────────────────
+
+def handle_merge(params):
+    result = merge_pdfs(params["pdf_paths"], params["output_path"])
+    return {"output_path": result}
+
+
+def handle_split(params):
+    pages = split_pdf(params["pdf_path"], params["output_dir"])
+    return {"page_paths": pages}
+
+
+def handle_reorder_pages(params):
+    result = reorder_pages(
+        params["pdf_path"], params["page_order"], params["output_path"]
+    )
+    return {"output_path": result}
+
+
+def handle_rotate_pages(params):
+    result = rotate_pages(
+        params["pdf_path"], params["pages"], params["angle"], params["output_path"]
+    )
+    return {"output_path": result}
+
+
+def handle_delete_pages(params):
+    result = delete_pages(
+        params["pdf_path"], params["pages"], params["output_path"]
+    )
+    return {"output_path": result}
+
+
+def handle_crop_pages(params):
+    box = params["box"]
+    result = crop_pages(
+        params["pdf_path"],
+        (box["x0"], box["y0"], box["x1"], box["y1"]),
+        params["output_path"],
+    )
+    return {"output_path": result}
+
+
+def handle_edit_metadata(params):
+    result = edit_metadata(
+        params["pdf_path"], params["metadata"], params["output_path"]
+    )
+    return {"output_path": result}
+
+
+def handle_add_bookmark(params):
+    result = add_bookmark(
+        params["pdf_path"], params["title"], params["page"], params["output_path"]
+    )
+    return {"output_path": result}
+
+
+def handle_encrypt(params):
+    result = encrypt_pdf(
+        params["pdf_path"],
+        params["owner_password"],
+        params["user_password"],
+        params["output_path"],
+    )
+    return {"output_path": result}
+
+
+def handle_decrypt(params):
+    result = decrypt_pdf(
+        params["pdf_path"], params["password"], params["output_path"]
+    )
+    return {"output_path": result}
+
+
+def handle_add_hyperlink(params):
+    bbox = params["bbox"]
+    result = add_hyperlink(
+        params["pdf_path"],
+        params["page"],
+        (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"]),
+        params["uri"],
+        params["output_path"],
+    )
+    return {"output_path": result}
+
+
+def handle_add_highlight(params):
+    result = add_highlight(
+        params["pdf_path"],
+        params["page"],
+        params["quad_points"],
+        params["output_path"],
+    )
+    return {"output_path": result}
+
+
+def handle_flatten_annotations(params):
+    result = flatten_annotations(params["pdf_path"], params["output_path"])
+    return {"output_path": result}
+
+
+def handle_fill_form(params):
+    result = fill_form(
+        params["pdf_path"], params["field_values"], params["output_path"]
+    )
+    return {"output_path": result}
+
+
+def handle_add_watermark(params):
+    result = add_watermark(
+        params["pdf_path"], params["watermark_path"], params["output_path"]
+    )
+    return {"output_path": result}
+
+
+# ── Annotation handlers (engine API) ─────────────────────────────────
+
+def handle_get_annotations(params):
+    pdf_path = params["pdf_path"]
+    page = params.get("page")
+    annots = get_annotations(pdf_path, page=page)
+    return {
+        "annotations": [
+            {
+                "index": a.index,
+                "page": a.page,
+                "subtype": a.subtype,
+                "rect": {
+                    "x0": a.rect[0], "y0": a.rect[1],
+                    "x1": a.rect[2], "y1": a.rect[3],
+                },
+                "uri": a.uri,
+                "text": a.text,
+            }
+            for a in annots
+        ]
+    }
+
+
+def handle_add_annotation(params):
+    rect = params["rect"]
+    add_annotation(
+        params["pdf_path"],
+        params["page"],
+        (rect["x0"], rect["y0"], rect["x1"], rect["y1"]),
+        params["uri"],
+        params["output_path"],
+        border_style=params.get("border_style", "none"),
+    )
+    return {"success": True, "output_path": params["output_path"]}
+
+
+def handle_delete_annotation_engine(params):
+    pdf_path = params["pdf_path"]
+    page = params["page"]
+    index = params["annotation_index"]
+    annots = get_annotations(pdf_path, page=page)
+    if index < 0 or index >= len(annots):
+        raise PDFEditError(
+            f"Annotation index {index} out of range (page has {len(annots)})"
+        )
+    engine_delete_annotation(pdf_path, annots[index], params["output_path"])
+    return {"success": True, "output_path": params["output_path"]}
+
+
+def handle_move_annotation(params):
+    pdf_path = params["pdf_path"]
+    page = params["page"]
+    index = params["annotation_index"]
+    new_rect = params["new_rect"]
+    annots = get_annotations(pdf_path, page=page)
+    if index < 0 or index >= len(annots):
+        raise PDFEditError(
+            f"Annotation index {index} out of range (page has {len(annots)})"
+        )
+    move_annotation(
+        pdf_path,
+        annots[index],
+        (new_rect["x0"], new_rect["y0"], new_rect["x1"], new_rect["y1"]),
+        params["output_path"],
+    )
+    return {"success": True, "output_path": params["output_path"]}
+
+
 # ── Dispatch table ────────────────────────────────────────────────────
 
 METHODS = {
@@ -523,6 +928,30 @@ METHODS = {
     "batch_replace_block": handle_batch_replace_block,
     "insert_text_block": handle_insert_text_block,
     "delete_block": handle_delete_block,
+    "get_text_layout": handle_get_text_layout,
+    "extract_bbox_text": handle_extract_bbox_text,
+    "detect_sections": handle_detect_sections,
+    # Wrapper operations
+    "merge": handle_merge,
+    "split": handle_split,
+    "reorder_pages": handle_reorder_pages,
+    "rotate_pages": handle_rotate_pages,
+    "delete_pages": handle_delete_pages,
+    "crop_pages": handle_crop_pages,
+    "edit_metadata": handle_edit_metadata,
+    "add_bookmark": handle_add_bookmark,
+    "encrypt": handle_encrypt,
+    "decrypt": handle_decrypt,
+    "add_hyperlink": handle_add_hyperlink,
+    "add_highlight": handle_add_highlight,
+    "flatten_annotations": handle_flatten_annotations,
+    "fill_form": handle_fill_form,
+    "add_watermark": handle_add_watermark,
+    # Annotation operations (engine API)
+    "get_annotations": handle_get_annotations,
+    "add_annotation": handle_add_annotation,
+    "delete_annotation_v2": handle_delete_annotation_engine,
+    "move_annotation": handle_move_annotation,
 }
 
 
