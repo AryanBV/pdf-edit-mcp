@@ -945,20 +945,43 @@ def handle_swap_sections(params):
                     "/A": action,
                 }))
 
+            # Detect sections on the OUTPUT to find where each sibling actually landed
+            sib_shifts = {}  # title → y_shift
+            try:
+                out_det = handle_detect_sections({
+                    "pdf_path": output_path, "page": page, "include_text": False,
+                })
+                out_all = []
+                for s in out_det["sections"]:
+                    out_all.append(s)
+                    for c in s.get("children", []):
+                        out_all.append(c)
+                for sib in siblings:
+                    # Find where this section's CONTENT landed in the output
+                    # Each section's annotations follow its own text
+                    # Match on first word (robust against spacing changes after re-render)
+                    first_word = sib["title"].split()[0].lower() if sib["title"].split() else ""
+                    out_sib = next(
+                        (s for s in out_all
+                         if s["level"] == sib["level"]
+                         and first_word
+                         and s["title"].lower().startswith(first_word)),
+                        None,
+                    )
+                    if out_sib:
+                        sib_shifts[sib["title"]] = out_sib["bbox"]["y1"] - sib["bbox"]["y1"]
+                    else:
+                        sib_shifts[sib["title"]] = 0.0
+            except Exception:
+                for sib in siblings:
+                    sib_shifts[sib["title"]] = 0.0
+
             for sib in siblings:
                 annots_for_sib = saved_annots.get(sib["title"], [])
+                dy = sib_shifts.get(sib["title"], 0.0)
                 for a in annots_for_sib:
-                    if sib["title"] == match_a["title"]:
-                        # a's annotations go to b's position
-                        new_rect = (a["rect"][0], a["rect"][1] - y_offset,
-                                    a["rect"][2], a["rect"][3] - y_offset)
-                    elif sib["title"] == match_b["title"]:
-                        # b's annotations go to a's position
-                        new_rect = (a["rect"][0], a["rect"][1] + y_offset,
-                                    a["rect"][2], a["rect"][3] + y_offset)
-                    else:
-                        # Unchanged siblings: restore at original position
-                        new_rect = a["rect"]
+                    new_rect = (a["rect"][0], a["rect"][1] + dy,
+                                a["rect"][2], a["rect"][3] + dy)
                     page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
 
             pdf.save(output_path)
