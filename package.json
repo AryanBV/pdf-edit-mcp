@@ -36,7 +36,16 @@
     "typescript",
     "ai-tools"
   ],
+  "author": "Aryan B V",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AryanBV/pdf-edit-mcp.git"
+  },
+  "homepage": "https://github.com/AryanBV/pdf-edit-mcp",
+  "bugs": {
+    "url": "https://github.com/AryanBV/pdf-edit-mcp/issues"
+  },
   "engines": {
     "node": ">=20"
   },
