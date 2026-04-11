@@ -9,6 +9,7 @@ goes to stderr. Responses use _stdout.write() exclusively.
 """
 
 import json
+import os
 import sys
 import io
 
@@ -1311,21 +1312,44 @@ def main():
 
         req_id = request.get("id")
         method = request.get("method")
+        params = request.get("params", {})
+
+        # Defense-in-depth: validate all path parameters before dispatch
+        path_invalid = False
+        if isinstance(params, dict):
+            for key, val in params.items():
+                if (key.endswith("_path") or key == "output_dir") and isinstance(val, str):
+                    if ".." in os.path.normpath(val).split(os.sep):
+                        respond_error(req_id, -32602, f"Invalid path parameter '{key}': contains '..'")
+                        path_invalid = True
+                        break
+                if key == "pdf_paths" and isinstance(val, list):
+                    for p in val:
+                        if isinstance(p, str) and ".." in os.path.normpath(p).split(os.sep):
+                            respond_error(req_id, -32602, f"Invalid path in '{key}': contains '..'")
+                            path_invalid = True
+                            break
+                    if path_invalid:
+                        break
+        if path_invalid:
+            continue
 
         if method not in METHODS:
             respond_error(req_id, -32601, f"Method not found: {method}")
             continue
 
         try:
-            result = METHODS[method](request.get("params", {}))
+            result = METHODS[method](params)
             respond_success(req_id, result)
         except (PDFEditError, FontNotFoundError) as e:
             respond_error(req_id, -32000, f"{type(e).__name__}: {e}")
         except FileNotFoundError as e:
-            respond_error(req_id, -32000, f"File not found: {e}")
+            respond_error(req_id, -32000, f"File not found: {getattr(e, 'filename', None) or 'unknown'}")
+        except PermissionError:
+            respond_error(req_id, -32000, "Permission denied")
         except Exception as e:
             print(f"Unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
-            respond_error(req_id, -32603, f"Internal error: {type(e).__name__}: {e}")
+            respond_error(req_id, -32603, f"Internal error: {type(e).__name__}")
 
 
 if __name__ == "__main__":

@@ -76,8 +76,11 @@ class BridgeProcess {
   private readline: Interface | null = null;
   private requestId = 0;
   private pending = new Map<number, PendingRequest>();
-  private hasRestarted = false;
+  private restartCount = 0;
+  private static readonly MAX_RESTARTS = 3;
   private callQueue: Promise<unknown> = Promise.resolve();
+  private queueDepth = 0;
+  private static readonly MAX_QUEUE = 100;
 
   async spawn(): Promise<void> {
     return new Promise<void>((resolveSpawn, rejectSpawn) => {
@@ -131,6 +134,7 @@ class BridgeProcess {
           pending.reject(new Error(response.error.message));
         } else {
           pending.resolve(response.result);
+          this.restartCount = 0; // Reset on successful communication
         }
       });
 
@@ -151,10 +155,18 @@ class BridgeProcess {
   }
 
   async call(method: string, params: Record<string, unknown>): Promise<unknown> {
-    // Serialize calls — only one in-flight at a time
-    const result = this.callQueue.then(() => this.doCall(method, params));
-    this.callQueue = result.catch(() => {});
-    return result;
+    if (this.queueDepth >= BridgeProcess.MAX_QUEUE) {
+      throw new Error("Bridge call queue full — server is overloaded");
+    }
+    this.queueDepth++;
+    try {
+      // Serialize calls — only one in-flight at a time
+      const result = this.callQueue.then(() => this.doCall(method, params));
+      this.callQueue = result.catch(() => {});
+      return await result;
+    } finally {
+      this.queueDepth--;
+    }
   }
 
   private doCall(
@@ -187,20 +199,29 @@ class BridgeProcess {
 
   private handleDeath(code: number | null): void {
     // Reject all pending requests
-    for (const [id, pending] of this.pending) {
+    for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
       pending.reject(new Error(`Bridge process died (code ${code})`));
-      this.pending.delete(id);
     }
+    this.pending.clear();
     this.process = null;
     this.readline = null;
 
-    if (!this.hasRestarted) {
-      this.hasRestarted = true;
-      console.error("bridge.py died unexpectedly, attempting restart...");
-      this.spawn().catch((err: Error) => {
-        console.error(`Failed to restart bridge.py: ${err.message}`);
-      });
+    if (this.restartCount < BridgeProcess.MAX_RESTARTS) {
+      this.restartCount++;
+      const delay = 1000 * this.restartCount;
+      console.error(
+        `bridge.py died (code ${code}), restart ${this.restartCount}/${BridgeProcess.MAX_RESTARTS} in ${delay}ms...`
+      );
+      setTimeout(() => {
+        this.spawn().catch((err: Error) => {
+          console.error(`Failed to restart bridge.py: ${err.message}`);
+        });
+      }, delay);
+    } else {
+      console.error(
+        `bridge.py died (code ${code}), max restarts (${BridgeProcess.MAX_RESTARTS}) exceeded`
+      );
     }
   }
 
