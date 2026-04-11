@@ -40,7 +40,7 @@ jobs:
 
       - run: npm ci
       - run: npm run build
-      - run: pip install git+https://github.com/AryanBV/pdf-edit-engine.git
+      - run: pip install git+https://github.com/AryanBV/pdf-edit-engine.git reportlab
       - run: python tests/generate_fixtures.py
       - run: npx vitest run tests/bridge.test.ts
         env:
