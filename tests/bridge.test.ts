@@ -8,8 +8,8 @@ import { existsSync, unlinkSync } from "node:fs";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BRIDGE_PATH = resolve(__dirname, "..", "bridge.py");
 const FIXTURE_PDF = resolve(__dirname, "fixtures", "reportlab_simple.pdf");
-const RESUME_PDF = resolve(__dirname, "fixtures", "resume_aryan.pdf");
-const PYTHON_CMD = process.env.PDF_EDIT_PYTHON || "C:/Python312/python.exe";
+const STRUCTURED_PDF = resolve(__dirname, "fixtures", "structured_doc.pdf");
+const PYTHON_CMD = process.env.PDF_EDIT_PYTHON || "python";
 
 interface JsonRpcResponse {
   jsonrpc: string;
@@ -322,7 +322,7 @@ describe("bridge.py integration tests", () => {
   });
 
   it("inspect on resume PDF returns non-empty annotations", async () => {
-    const res = await call("inspect", { pdf_path: RESUME_PDF });
+    const res = await call("inspect", { pdf_path: STRUCTURED_PDF });
     expect(res.error).toBeUndefined();
     expect(res.result).toBeDefined();
     const annotations = res.result!.annotations as Array<Record<string, unknown>>;
@@ -338,14 +338,14 @@ describe("bridge.py integration tests", () => {
     const outputPath = resolve(__dirname, "fixtures", "test_annot_output.pdf");
     try {
       // First inspect to find an annotation with a URL
-      const inspectRes = await call("inspect", { pdf_path: RESUME_PDF });
+      const inspectRes = await call("inspect", { pdf_path: STRUCTURED_PDF });
       expect(inspectRes.error).toBeUndefined();
       const annotations = inspectRes.result!.annotations as Array<Record<string, unknown>>;
       const linkAnnot = annotations.find((a) => a.url !== undefined);
       expect(linkAnnot).toBeDefined();
 
       const res = await call("update_annotation", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page: linkAnnot!.page as number,
         annotation_index: linkAnnot!.index as number,
         url: "https://example.com/updated",
@@ -364,7 +364,7 @@ describe("bridge.py integration tests", () => {
   it("update_annotation with invalid index returns error", async () => {
     const outputPath = resolve(__dirname, "fixtures", "test_annot_bad.pdf");
     const res = await call("update_annotation", {
-      pdf_path: RESUME_PDF,
+      pdf_path: STRUCTURED_PDF,
       page: 0,
       annotation_index: 999,
       url: "https://example.com",
@@ -406,7 +406,7 @@ describe("bridge.py integration tests", () => {
     try {
       // Get a paragraph bbox from detect_paragraphs
       const detectRes = await call("detect_paragraphs", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page: 0,
       });
       expect(detectRes.error).toBeUndefined();
@@ -415,7 +415,7 @@ describe("bridge.py integration tests", () => {
       const bbox = paragraphs[0].bbox as Record<string, number>;
 
       const res = await call("replace_block", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page: 0,
         bbox,
         new_text: "REPLACED CONTENT",
@@ -446,7 +446,7 @@ describe("bridge.py integration tests", () => {
     try {
       // Get two paragraph bboxes
       const detectRes = await call("detect_paragraphs", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page: 0,
       });
       expect(detectRes.error).toBeUndefined();
@@ -456,7 +456,7 @@ describe("bridge.py integration tests", () => {
       const bbox2 = paragraphs[1].bbox as Record<string, number>;
 
       const res = await call("batch_replace_block", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page_number: 0,
         replacements: [
           { bbox: bbox1, new_text: "FIRST BLOCK REPLACED" },
@@ -492,7 +492,7 @@ describe("bridge.py integration tests", () => {
     const outputPath = resolve(__dirname, "fixtures", "test_batch_block_fidelity.pdf");
     try {
       const detectRes = await call("detect_paragraphs", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page: 0,
       });
       expect(detectRes.error).toBeUndefined();
@@ -500,7 +500,7 @@ describe("bridge.py integration tests", () => {
       const bbox = paragraphs[0].bbox as Record<string, number>;
 
       const res = await call("batch_replace_block", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page_number: 0,
         replacements: [{ bbox, new_text: "FIDELITY CHECK" }],
         output_path: outputPath,
@@ -529,7 +529,7 @@ describe("bridge.py integration tests", () => {
     const outputPath = resolve(__dirname, "fixtures", "test_insert_block.pdf");
     try {
       const res = await call("insert_text_block", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page: 0,
         x: 72,
         y: 700,
@@ -557,7 +557,7 @@ describe("bridge.py integration tests", () => {
     try {
       // Get a paragraph bbox and its text
       const detectRes = await call("detect_paragraphs", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page: 0,
       });
       expect(detectRes.error).toBeUndefined();
@@ -568,7 +568,7 @@ describe("bridge.py integration tests", () => {
       const originalText = (targetParagraph.text as string).slice(0, 30);
 
       const res = await call("delete_block", {
-        pdf_path: RESUME_PDF,
+        pdf_path: STRUCTURED_PDF,
         page: 0,
         bbox,
         output_path: outputPath,
@@ -616,7 +616,7 @@ describe("bridge.py integration tests", () => {
   it("replace_block with invalid bbox returns error, bridge survives", async () => {
     const outputPath = resolve(__dirname, "fixtures", "test_bad_bbox.pdf");
     const res = await call("replace_block", {
-      pdf_path: RESUME_PDF,
+      pdf_path: STRUCTURED_PDF,
       page: 0,
       bbox: { x0: 9999, y0: 9999, x1: 9999, y1: 9999 },
       new_text: "Should fail",

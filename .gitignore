@@ -144,3 +144,4 @@ vite.config.ts.timestamp-*
 demo_output/
 __pycache__/
 tests/stress_output/
+tests/fixtures/*.pdf

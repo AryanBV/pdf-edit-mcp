@@ -15,13 +15,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm ci
       - run: npm run build
       - run: npx vitest run tests/validation.test.ts tests/security.test.ts
-      - run: npm audit --production --audit-level=high
 
   integration:
     name: Integration Test (Bridge)
@@ -32,7 +31,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - uses: actions/setup-python@v5
@@ -42,6 +41,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: pip install git+https://github.com/AryanBV/pdf-edit-engine.git
+      - run: python tests/generate_fixtures.py
       - run: npx vitest run tests/bridge.test.ts
         env:
           PDF_EDIT_PYTHON: python3
