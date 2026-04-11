@@ -727,6 +727,86 @@ def handle_detect_sections(params):
     }
 
 
+def _get_link_annotations_in_bbox(pdf_path, page, bbox):
+    """Get Link annotations whose CENTER is within a bbox."""
+    annots = get_annotations(pdf_path, page=page)
+    result = []
+    for a in annots:
+        if a.subtype != "Link" or not a.uri:
+            continue
+        # Use center-point containment (not overlap) to avoid boundary bleed
+        cy = (a.rect[1] + a.rect[3]) / 2
+        cx = (a.rect[0] + a.rect[2]) / 2
+        if (bbox["y0"] < cy < bbox["y1"] and bbox["x0"] < cx < bbox["x1"]):
+            result.append({"rect": a.rect, "uri": a.uri})
+    return result
+
+
+def _transfer_annotations(output_path, page, bbox_a, bbox_b, annots_a, annots_b):
+    """Remove annotations in both bboxes, re-add them at swapped positions."""
+    y_offset = bbox_a["y1"] - bbox_b["y1"]  # b→a: shift up by this
+
+    with pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
+        page_obj = pdf.pages[page]
+        annots_key = pikepdf.Name("/Annots")
+        rect_key = pikepdf.Name("/Rect")
+
+        # Step 1: Remove annotations whose center is in either section bbox
+        if annots_key in page_obj:
+            kept = []
+            for annot_ref in list(page_obj[annots_key]):
+                remove = False
+                try:
+                    annot = annot_ref
+                    if hasattr(annot, "resolve"):
+                        annot = annot.resolve()
+                    if isinstance(annot, pikepdf.Dictionary) and rect_key in annot:
+                        r = annot[rect_key]
+                        cy = (float(r[1]) + float(r[3])) / 2
+                        cx = (float(r[0]) + float(r[2])) / 2
+                        in_a = (bbox_a["y0"] < cy < bbox_a["y1"]
+                                and bbox_a["x0"] < cx < bbox_a["x1"])
+                        in_b = (bbox_b["y0"] < cy < bbox_b["y1"]
+                                and bbox_b["x0"] < cx < bbox_b["x1"])
+                        remove = in_a or in_b
+                except Exception as e:
+                    print(f"Annotation removal skip: {e}", file=sys.stderr)
+                if not remove:
+                    kept.append(annot_ref)
+            page_obj[annots_key] = pikepdf.Array(kept) if kept else pikepdf.Array()
+
+        # Step 2: Re-add saved annotations at swapped positions
+        if annots_key not in page_obj:
+            page_obj[annots_key] = pikepdf.Array()
+
+        def _make_link(rect_tuple, uri):
+            action = pikepdf.Dictionary({
+                "/S": pikepdf.Name("/URI"),
+                "/URI": pikepdf.String(uri),
+            })
+            return pdf.make_indirect(pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Link"),
+                "/Rect": pikepdf.Array([float(v) for v in rect_tuple]),
+                "/Border": pikepdf.Array([0, 0, 0]),
+                "/A": action,
+            }))
+
+        # annots_a (from bbox_a) → go to bbox_b position: shift down
+        for a in annots_a:
+            new_rect = (a["rect"][0], a["rect"][1] - y_offset,
+                        a["rect"][2], a["rect"][3] - y_offset)
+            page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
+
+        # annots_b (from bbox_b) → go to bbox_a position: shift up
+        for a in annots_b:
+            new_rect = (a["rect"][0], a["rect"][1] + y_offset,
+                        a["rect"][2], a["rect"][3] + y_offset)
+            page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
+
+        pdf.save(output_path)
+
+
 def handle_swap_sections(params):
     """Swap two sections by name — detects structure, finds siblings, swaps."""
     pdf_path = params["pdf_path"]
@@ -789,6 +869,16 @@ def handle_swap_sections(params):
     else:
         siblings = [s for s in all_secs if s["level"] == target_level]
 
+    # Save annotations from ALL sibling sections BEFORE the swap
+    # (engine's _sync_annotations_in_bbox may remove them during batch_replace_block)
+    saved_annots = {}  # title → list of {rect, uri}
+    for sib in siblings:
+        saved_annots[sib["title"]] = _get_link_annotations_in_bbox(
+            pdf_path, page, sib["bbox"]
+        )
+    annots_a = saved_annots.get(match_a["title"], [])
+    annots_b = saved_annots.get(match_b["title"], [])
+
     # Build replacements: swap a↔b, keep rest unchanged
     replacements = []
     for sib in siblings:
@@ -804,10 +894,80 @@ def handle_swap_sections(params):
         "replacements": replacements, "output_path": output_path,
     })
 
+    # Restore all annotations: swap pair at swapped positions, siblings at original
+    total_annots = sum(len(v) for v in saved_annots.values())
+    if total_annots > 0:
+        y_offset = match_a["bbox"]["y1"] - match_b["bbox"]["y1"]
+
+        with pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
+            page_obj = pdf.pages[page]
+            annots_key = pikepdf.Name("/Annots")
+            rect_key = pikepdf.Name("/Rect")
+
+            # Remove all annotations in ALL sibling bboxes (clean slate)
+            if annots_key in page_obj:
+                kept = []
+                for annot_ref in list(page_obj[annots_key]):
+                    remove = False
+                    try:
+                        annot = annot_ref
+                        if hasattr(annot, "resolve"):
+                            annot = annot.resolve()
+                        if isinstance(annot, pikepdf.Dictionary) and rect_key in annot:
+                            r = annot[rect_key]
+                            cy = (float(r[1]) + float(r[3])) / 2
+                            cx = (float(r[0]) + float(r[2])) / 2
+                            for sib in siblings:
+                                b = sib["bbox"]
+                                if b["y0"] < cy < b["y1"] and b["x0"] < cx < b["x1"]:
+                                    remove = True
+                                    break
+                    except Exception:
+                        pass
+                    if not remove:
+                        kept.append(annot_ref)
+                page_obj[annots_key] = pikepdf.Array(kept) if kept else pikepdf.Array()
+
+            # Re-add all saved annotations at correct positions
+            if annots_key not in page_obj:
+                page_obj[annots_key] = pikepdf.Array()
+
+            def _make_link(rect_tuple, uri):
+                action = pikepdf.Dictionary({
+                    "/S": pikepdf.Name("/URI"),
+                    "/URI": pikepdf.String(uri),
+                })
+                return pdf.make_indirect(pikepdf.Dictionary({
+                    "/Type": pikepdf.Name("/Annot"),
+                    "/Subtype": pikepdf.Name("/Link"),
+                    "/Rect": pikepdf.Array([float(v) for v in rect_tuple]),
+                    "/Border": pikepdf.Array([0, 0, 0]),
+                    "/A": action,
+                }))
+
+            for sib in siblings:
+                annots_for_sib = saved_annots.get(sib["title"], [])
+                for a in annots_for_sib:
+                    if sib["title"] == match_a["title"]:
+                        # a's annotations go to b's position
+                        new_rect = (a["rect"][0], a["rect"][1] - y_offset,
+                                    a["rect"][2], a["rect"][3] - y_offset)
+                    elif sib["title"] == match_b["title"]:
+                        # b's annotations go to a's position
+                        new_rect = (a["rect"][0], a["rect"][1] + y_offset,
+                                    a["rect"][2], a["rect"][3] + y_offset)
+                    else:
+                        # Unchanged siblings: restore at original position
+                        new_rect = a["rect"]
+                    page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
+
+            pdf.save(output_path)
+
     return {
         "success": all(r["success"] for r in result["results"]),
         "swapped": [match_a["title"][:50], match_b["title"][:50]],
         "siblings_rerendered": len(siblings),
+        "annotations_transferred": total_annots,
         "output_path": output_path,
     }
 

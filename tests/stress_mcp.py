@@ -35,7 +35,7 @@ from bridge import (
 )
 from pdf_edit_engine.errors import PDFEditError
 
-RESUME = "C:/New Project/pdf-edit-engine/tests/corpus/resume_aryan.pdf"
+RESUME = "C:/New Project/pdf-edit-engine/tests/corpus/Aryan_BV_Resume_2026.pdf"
 OUT = os.path.join(os.path.dirname(__file__), "stress_output")
 
 # ── Infrastructure ───────────────────────────────────────────────────
