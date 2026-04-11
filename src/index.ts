@@ -232,10 +232,23 @@ function toolError(message: string) {
 
 // ── Server setup ─────────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: "pdf-edit-mcp",
-  version: "0.1.0",
-});
+const server = new McpServer(
+  {
+    name: "pdf-edit-mcp",
+    version: "0.1.0",
+  },
+  {
+    instructions:
+      "pdf-edit-mcp edits text in existing PDFs while preserving fonts and layout.\n\n" +
+      "TOOL GUIDE:\n" +
+      "Section operations (swap, rewrite, move sections): pdf_swap_sections, pdf_replace_section\n" +
+      "Text operations (names, dates, typos, labels): pdf_replace_text, pdf_batch_replace\n" +
+      "Structure analysis (understand sections, fonts, layout): pdf_inspect, pdf_detect_sections\n" +
+      "Document operations (merge, split, rotate, encrypt): pdf_merge, pdf_split, pdf_rotate_pages, pdf_encrypt\n" +
+      "Annotations (links, highlights, bookmarks): pdf_get_annotations, pdf_add_annotation\n\n" +
+      "Always output to a NEW file path — never overwrite the input PDF.",
+  }
+);
 
 const bridge = new BridgeProcess();
 
