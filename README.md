@@ -27,7 +27,7 @@ Powered by [pdf-edit-engine](https://github.com/AryanBV/pdf-edit-engine) — a P
 
 - 38 tools across 7 categories (reading, text editing, block ops, section ops, annotations, document manipulation, metadata & security)
 - 3 built-in MCP prompts that guide the editing workflow step by step
-- Fidelity reporting — every edit returns whether fonts were preserved, overflow detected, and reflow applied
+- Fidelity reporting — every edit returns whether fonts were preserved or substituted (with the substitute font name when fallback occurred), overflow detected, reflow applied, and which glyphs were missing if any
 - Batch operations — up to 500 find-and-replace edits in a single atomic call with auto-verification
 - Section intelligence — detects document structure by font hierarchy, swaps sections by fuzzy title match
 - Full document manipulation — merge, split, rotate, reorder, crop, watermark, encrypt, decrypt, fill forms
@@ -39,7 +39,7 @@ Powered by [pdf-edit-engine](https://github.com/AryanBV/pdf-edit-engine) — a P
 
 - **Node.js** 20+
 - **Python** 3.12+
-- **pdf-edit-engine**: `pip install pdf-edit-engine`
+- **pdf-edit-engine** ≥ 0.1.2: `pip install "pdf-edit-engine>=0.1.2"`
 
 ### Claude Desktop
 

@@ -138,10 +138,10 @@ class BridgeProcess {
         }
       });
 
-      // Listen for "ready" on stderr
+      // Listen for "ready" on stderr (banner may include engine version: "ready (engine v0.1.2)")
       const stderrRl = createInterface({ input: proc.stderr! });
       stderrRl.on("line", (line: string) => {
-        if (line === "ready" && !startupResolved) {
+        if (line.startsWith("ready") && !startupResolved) {
           startupResolved = true;
           this.process = proc;
           this.readline = rl;
@@ -289,9 +289,11 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path }) => {
+  async ({ pdf_path, page }) => {
     try {
-      const result = await bridge.call("get_text", { pdf_path });
+      const params: Record<string, unknown> = { pdf_path };
+      if (page !== undefined) params.page = page;
+      const result = await bridge.call("get_text", params);
       return toolSuccess(result);
     } catch (err) {
       return toolError(err instanceof Error ? err.message : String(err));
@@ -306,7 +308,8 @@ server.registerTool(
   {
     description:
       "Find all occurrences of a search string with positions and page numbers. " +
-      "Use to verify text exists before a targeted edit.",
+      "Use to verify text exists before a targeted edit. " +
+      "Optional `page` parameter restricts the search to one 0-indexed page.",
     inputSchema: findTextInputSchema,
     annotations: {
       readOnlyHint: true,
@@ -315,13 +318,15 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path, search, case_sensitive }) => {
+  async ({ pdf_path, search, case_sensitive, page }) => {
     try {
-      const result = await bridge.call("find_text", {
+      const params: Record<string, unknown> = {
         pdf_path,
         search,
         case_sensitive,
-      });
+      };
+      if (page !== undefined) params.page = page;
+      const result = await bridge.call("find_text", params);
       return toolSuccess(result);
     } catch (err) {
       return toolError(err instanceof Error ? err.message : String(err));
@@ -339,7 +344,11 @@ server.registerTool(
       "dates, typos, or labels. For 2+ related changes, use pdf_batch_replace. " +
       "Do NOT use for swapping or rewriting entire sections — use " +
       "pdf_swap_sections or pdf_replace_section instead. " +
-      "Call pdf_inspect first to understand the document.",
+      "Call pdf_inspect first to understand the document. " +
+      "After the edit, inspect each result's fidelity report — " +
+      "font_substituted (set when a metric-equivalent fallback fired, e.g. " +
+      "'Carlito-Regular' for Calibri), glyphs_missing (characters that won't " +
+      "render), and warnings (auto-includes overflow notices).",
     inputSchema: replaceTextInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -348,10 +357,10 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path, search, replacement, output_path, reflow }) => {
+  async ({ pdf_path, search, replacement, output_path, reflow, dry_run }) => {
     try {
       const warnings: string[] = [];
-      if (output_path === pdf_path) {
+      if (output_path === pdf_path && !dry_run) {
         warnings.push(
           "Warning: output_path is the same as pdf_path. The original file will be overwritten."
         );
@@ -362,6 +371,7 @@ server.registerTool(
         replacement,
         output_path,
         reflow,
+        dry_run,
       });
       if (warnings.length > 0) {
         const data = result as Record<string, unknown>;
@@ -384,7 +394,9 @@ server.registerTool(
       "PREFERRED for 2+ simple text changes in one call — renaming, dates, labels, " +
       "template fields. Do NOT use for swapping or rewriting entire sections — " +
       "use pdf_swap_sections or pdf_replace_section instead. " +
-      "Include ALL related text changes in one call.",
+      "Include ALL related text changes in one call. " +
+      "Each per-result entry surfaces a full fidelity report: check " +
+      "font_substituted, glyphs_missing, and warnings to verify edit quality.",
     inputSchema: batchReplaceInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -393,10 +405,10 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path, edits, output_path }) => {
+  async ({ pdf_path, edits, output_path, dry_run }) => {
     try {
       const warnings: string[] = [];
-      if (output_path === pdf_path) {
+      if (output_path === pdf_path && !dry_run) {
         warnings.push(
           "Warning: output_path is the same as pdf_path. The original file will be overwritten."
         );
@@ -405,6 +417,7 @@ server.registerTool(
         pdf_path,
         edits,
         output_path,
+        dry_run,
       });
       if (warnings.length > 0) {
         const data = result as Record<string, unknown>;
@@ -434,9 +447,11 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path }) => {
+  async ({ pdf_path, page }) => {
     try {
-      const result = await bridge.call("get_fonts", { pdf_path });
+      const params: Record<string, unknown> = { pdf_path };
+      if (page !== undefined) params.page = page;
+      const result = await bridge.call("get_fonts", params);
       return toolSuccess(result);
     } catch (err) {
       return toolError(err instanceof Error ? err.message : String(err));
@@ -508,7 +523,9 @@ server.registerTool(
   {
     description:
       "Replace only one specific occurrence by match index. Call pdf_find_text first " +
-      "to see all matches and choose the right index.",
+      "to see all matches and choose the right index. " +
+      "After the edit, inspect the fidelity report's font_substituted, " +
+      "glyphs_missing, and warnings to verify quality.",
     inputSchema: replaceSingleInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -517,10 +534,10 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path, search, match_index, replacement, output_path, reflow }) => {
+  async ({ pdf_path, search, match_index, replacement, output_path, reflow, dry_run }) => {
     try {
       const warnings: string[] = [];
-      if (output_path === pdf_path) {
+      if (output_path === pdf_path && !dry_run) {
         warnings.push(
           "Warning: output_path is the same as pdf_path. The original file will be overwritten."
         );
@@ -532,6 +549,7 @@ server.registerTool(
         replacement,
         output_path,
         reflow,
+        dry_run,
       });
       if (warnings.length > 0) {
         const data = result as Record<string, unknown>;
@@ -627,7 +645,10 @@ server.registerTool(
       "pdf_detect_paragraphs first to get bounding boxes. This is the PREFERRED tool " +
       "for multi-line edits — it replaces by position, not by string matching, so it " +
       "handles em dashes, ligatures, and line breaks correctly. If the replacement " +
-      "text overflows the bbox vertically, content below is automatically shifted down.",
+      "text overflows the bbox vertically, content below is automatically shifted down. " +
+      "Optional line_height (engine v0.1.2+) sets explicit line spacing in points; " +
+      "useful for matching sibling sections. After the edit, check the fidelity " +
+      "report's font_substituted, glyphs_missing, and warnings.",
     inputSchema: replaceBlockInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -636,7 +657,7 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path, page, bbox, new_text, output_path, font_name, font_size }) => {
+  async ({ pdf_path, page, bbox, new_text, output_path, font_name, font_size, line_height }) => {
     try {
       const warnings: string[] = [];
       if (output_path === pdf_path) {
@@ -653,6 +674,7 @@ server.registerTool(
       };
       if (font_name !== undefined) params.font_name = font_name;
       if (font_size !== undefined) params.font_size = font_size;
+      if (line_height !== undefined) params.line_height = line_height;
       const result = await bridge.call("replace_block", params);
       if (warnings.length > 0) {
         const data = result as Record<string, unknown>;
@@ -675,7 +697,11 @@ server.registerTool(
       "For section swaps use pdf_swap_sections instead (simpler). " +
       "For rewriting one section use pdf_replace_section instead (simpler). " +
       "Use this tool for advanced multi-block edits where you have explicit bboxes. " +
-      "Replacements are processed top-to-bottom with cumulative vertical shift tracking.",
+      "Replacements are processed top-to-bottom with cumulative vertical shift tracking. " +
+      "Optional line_height + section_gap (engine v0.1.2+) enforce uniform line spacing " +
+      "and inter-section gap respectively; useful for keeping sibling sections aligned " +
+      "when their replacements differ in length. Each per-result entry surfaces a full " +
+      "fidelity report (font_substituted, glyphs_missing, warnings).",
     inputSchema: batchReplaceBlockInputSchema,
     annotations: {
       readOnlyHint: false,
@@ -684,7 +710,7 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path, page_number, replacements, output_path }) => {
+  async ({ pdf_path, page_number, replacements, output_path, line_height, section_gap }) => {
     try {
       const warnings: string[] = [];
       if (output_path === pdf_path) {
@@ -692,12 +718,15 @@ server.registerTool(
           "Warning: output_path is the same as pdf_path. The original file will be overwritten."
         );
       }
-      const result = await bridge.call("batch_replace_block", {
+      const params: Record<string, unknown> = {
         pdf_path,
         page_number,
         replacements,
         output_path,
-      });
+      };
+      if (line_height !== undefined) params.line_height = line_height;
+      if (section_gap !== undefined) params.section_gap = section_gap;
+      const result = await bridge.call("batch_replace_block", params);
       if (warnings.length > 0) {
         const data = result as Record<string, unknown>;
         data.warnings = warnings;
@@ -1220,12 +1249,19 @@ server.registerPrompt(
             "  → Call pdf_find_text to locate all occurrences.\n\n" +
             "STEP 3 — PRE-CHECK\n" +
             "If replacement text has unusual characters (bullets •, em-dashes —, non-Latin):\n" +
-            "  → Call pdf_analyze_subset to verify font support.\n\n" +
+            "  → Call pdf_analyze_subset to verify font support.\n" +
+            "For destructive edits you want to verify before committing to disk:\n" +
+            "  → Call pdf_replace_text / pdf_replace_single / pdf_batch_replace with\n" +
+            "    dry_run=true. The response includes the full per-result fidelity report\n" +
+            "    (font_substituted, glyphs_missing, warnings) without writing the output.\n" +
+            "    Re-run with dry_run=false (or omitted) once you're satisfied.\n\n" +
             "STEP 4 — EXECUTE\n" +
             "Section swaps/rewrites:\n" +
             "  Use pdf_batch_replace_block with ALL sibling sections at the same level.\n" +
             "  Include unchanged siblings with their original text for uniform spacing.\n" +
-            "  Do NOT pass line_height or section_gap — the engine auto-detects.\n" +
+            "  By default omit line_height/section_gap — the engine auto-detects.\n" +
+            "  Pass them only when sibling replacements differ in length and you need\n" +
+            "  uniform spacing locked in (engine v0.1.2+).\n" +
             "Single block edits:\n" +
             "  Use pdf_replace_block with the section's bbox.\n" +
             "Text find-and-replace:\n" +
@@ -1241,7 +1277,13 @@ server.registerPrompt(
             "  - No duplicate headers or content\n" +
             "  - No missing sections\n" +
             "  - No spurious spaces ('month ly', 'full - stack')\n" +
-            "  - All replacement text appears in expected regions\n\n" +
+            "  - All replacement text appears in expected regions\n" +
+            "Also inspect every edit's fidelity report:\n" +
+            "  - font_substituted: non-null means a metric-equivalent font was used\n" +
+            "    (e.g. 'Carlito-Regular' for Calibri); the visual is close but not exact.\n" +
+            "  - glyphs_missing: any non-empty list means those characters won't render.\n" +
+            "  - warnings: an 'overflow' entry means the replacement extended past\n" +
+            "    available space; investigate and consider shorter text or reflow=true.\n\n" +
             "FALLBACK — If pdf_detect_sections returns empty or unexpected results:\n" +
             "  1. Call pdf_get_text_layout for raw block data\n" +
             "  2. Identify heading blocks by font (bold font at left margin)\n" +
@@ -1251,8 +1293,9 @@ server.registerPrompt(
             "RULES:\n" +
             '- "Swap" a section means ALL its content — title, tech stack, every bullet.\n' +
             "- When swapping, replace ALL sibling sections (not just the two being swapped).\n" +
-            "- Never pass line_height or section_gap to batch_replace_block unless asked.\n" +
-            "- Do text edits BEFORE annotation edits (text edits may shift indices).",
+            "- Pass line_height/section_gap only when explicitly needed for uniform spacing.\n" +
+            "- Do text edits BEFORE annotation edits (text edits may shift indices).\n" +
+            "- An OperatorError 'TextMatch is stale' means re-run pdf_find_text and retry.",
         },
       },
     ],
@@ -1279,8 +1322,12 @@ server.registerPrompt(
             "4. Call pdf_batch_replace_block with ALL siblings:\n" +
             "   - Swapped sections get each other's text.\n" +
             "   - Unchanged siblings get their original text (re-rendered for uniform spacing).\n" +
-            "   - Do NOT pass line_height or section_gap.\n" +
-            "5. Verify with pdf_get_text on the output — check no duplication, no missing content.\n\n" +
+            "   - Default: omit line_height/section_gap — engine auto-detects.\n" +
+            "   - Pass them only if sibling lengths differ markedly and you need\n" +
+            "     locked-in uniform spacing (engine v0.1.2+).\n" +
+            "5. Verify with pdf_get_text on the output — check no duplication, no missing content.\n" +
+            "6. Inspect each per-result fidelity report for font_substituted (font fallback),\n" +
+            "   glyphs_missing (unrenderable characters), and warnings.\n\n" +
             "IMPORTANT: Always include ALL siblings, not just the two being swapped.\n" +
             "This ensures uniform spacing across the entire parent section.",
         },
@@ -1304,7 +1351,14 @@ server.registerPrompt(
             "For simple text changes:\n" +
             "1. Call pdf_find_text to locate and confirm the text exists\n" +
             "2. Call pdf_replace_text or pdf_replace_single\n" +
-            "3. Check font_preserved in the fidelity report",
+            "3. Inspect each result's fidelity report:\n" +
+            "   - font_preserved: false means the original font wasn't used end-to-end\n" +
+            "   - font_substituted: non-null = metric-equivalent fallback (e.g. Carlito for Calibri)\n" +
+            "   - glyphs_missing: any non-empty list = characters that won't render\n" +
+            "   - warnings: an 'overflow' entry = replacement extended past available space\n" +
+            "If an OperatorError surfaces with 'TextMatch is stale' — that's a v0.1.2 guard:\n" +
+            "the matches you used were invalidated by a prior edit. Re-call pdf_find_text\n" +
+            "and retry with the fresh matches.",
         },
       },
     ],

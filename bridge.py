@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import io
+from contextlib import contextmanager
 
 # Wrap stdin/stdout in UTF-8 BEFORE saving references (Windows defaults to cp1252)
 sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
@@ -33,7 +34,13 @@ try:
         analyze_subset,
         Edit,
     )
-    from pdf_edit_engine.errors import PDFEditError, FontNotFoundError
+    from pdf_edit_engine.errors import (
+        PDFEditError,
+        FontNotFoundError,
+        OperatorError,
+        EncodingError,
+        ReflowError,
+    )
     from pdf_edit_engine.structural import (
         replace_block,
         insert_text_block,
@@ -65,12 +72,37 @@ try:
         move_annotation,
         Annotation,
     )
+    try:
+        from pdf_edit_engine import __version__ as _engine_version
+    except ImportError:
+        _engine_version = "unknown"
 except ImportError as e:
     print(
         json.dumps({"error": f"pdf-edit-engine not installed: {e}"}),
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+# ── pikepdf exception translation (closes INV-L-1 on the MCP side) ────
+
+@contextmanager
+def _translate_pikepdf(pdf_path):
+    """Translate raw pikepdf exceptions into PDFEditError for direct opens.
+
+    Engine-internal opens flow through pdf_edit_engine._pathutil.open_pdf,
+    which already does this. Bridge.py still has direct pikepdf.open() calls
+    in a few places (page-count reads, section-swap annotation surgery)
+    where the engine doesn't expose a substitute API. This wrapper lets
+    those sites stay direct without leaking pikepdf.PasswordError /
+    PdfError to the JSON-RPC client.
+    """
+    try:
+        yield
+    except pikepdf.PasswordError as e:
+        raise PDFEditError(f"PDF is password-protected: {pdf_path}") from e
+    except pikepdf.PdfError as e:
+        raise PDFEditError(f"Failed to open PDF {pdf_path}: {e}") from e
 
 
 # ── Response helpers ──────────────────────────────────────────────────
@@ -115,8 +147,9 @@ def _serialize_edit_result(result):
 
 def handle_get_text(params):
     pdf_path = params["pdf_path"]
-    text = get_text(pdf_path)
-    with pikepdf.open(pdf_path) as pdf:
+    page = params.get("page")
+    text = get_text(pdf_path, page=page) if page is not None else get_text(pdf_path)
+    with _translate_pikepdf(pdf_path), pikepdf.open(pdf_path) as pdf:
         page_count = len(pdf.pages)
     return {"text": text, "page_count": page_count}
 
@@ -125,7 +158,11 @@ def handle_find_text(params):
     pdf_path = params["pdf_path"]
     search = params["search"]
     case_sensitive = params.get("case_sensitive", True)
-    matches = find(pdf_path, search, case_sensitive=case_sensitive)
+    page = params.get("page")
+    if page is not None:
+        matches = find(pdf_path, search, case_sensitive=case_sensitive, page=page)
+    else:
+        matches = find(pdf_path, search, case_sensitive=case_sensitive)
     return {
         "matches": [
             {
@@ -148,27 +185,41 @@ def handle_replace_text(params):
     search = params["search"]
     replacement = params["replacement"]
     output_path = params["output_path"]
+    reflow = params.get("reflow", True)
+    dry_run = params.get("dry_run", False)
 
-    results = replace_all(pdf_path, search, replacement, output_path)
+    results = replace_all(
+        pdf_path, search, replacement, output_path,
+        reflow=reflow, dry_run=dry_run,
+    )
 
     if not results:
         return {
             "success": False,
             "edits_applied": 0,
             "message": "No matches found",
-            "fidelity": {"font_preserved": True, "overflow_detected": False},
+            "results": [],
+            "dry_run": dry_run,
         }
 
-    succeeded = [r for r in results if r.success]
+    serialized = [_serialize_edit_result(r) for r in results]
+    succeeded = sum(1 for r in results if r.success)
     return {
-        "success": len(succeeded) > 0,
-        "edits_applied": len(succeeded),
+        "success": succeeded > 0,
+        "edits_applied": succeeded,
+        "dry_run": dry_run,
+        "results": serialized,
+        # Aggregated fidelity (back-compat with v0.1.0 clients).
+        # Per-match detail lives in `results[i].fidelity`.
         "fidelity": {
             "font_preserved": all(
                 r.fidelity_report.font_preserved for r in results
             ),
             "overflow_detected": any(
                 r.fidelity_report.overflow_detected for r in results
+            ),
+            "any_substitution": any(
+                bool(r.fidelity_report.font_substituted) for r in results
             ),
         },
     }
@@ -178,47 +229,39 @@ def handle_batch_replace(params):
     pdf_path = params["pdf_path"]
     edits = [Edit(find=e["find"], replace=e["replace"]) for e in params["edits"]]
     output_path = params["output_path"]
+    dry_run = params.get("dry_run", False)
 
-    results = batch_replace(pdf_path, edits, output_path)
+    results = batch_replace(pdf_path, edits, output_path, dry_run=dry_run)
 
-    mapped = []
-    for r in results:
-        mapped.append({
-            "success": r.success,
-            "original_text": r.original_text,
-            "new_text": r.new_text,
-            "font_action": r.font_action,
-            "warnings": r.warnings,
-            "fidelity": {
-                "font_preserved": r.fidelity_report.font_preserved,
-                "overflow_detected": r.fidelity_report.overflow_detected,
-                "reflow_applied": r.fidelity_report.reflow_applied,
-            },
-        })
-
+    mapped = [_serialize_edit_result(r) for r in results]
     succeeded = sum(1 for r in results if r.success)
 
-    # Auto-verification: read output and check replacements appear
+    # Auto-verification: read the written file back and check replacements
+    # appear. Skipped on dry_run because no file was written.
     verification = {
         "output_text_preview": "",
         "all_replacements_confirmed": True,
         "unconfirmed": [],
     }
-    try:
-        output_text = get_text(output_path)
-        verification["output_text_preview"] = output_text[:500]
-        for edit in params["edits"]:
-            replace_str = edit["replace"]
-            if not replace_str:
-                continue  # Empty replacement — skip
-            if replace_str not in output_text:
-                verification["all_replacements_confirmed"] = False
-                verification["unconfirmed"].append(replace_str)
-    except Exception as e:
-        print(f"Verification warning: {e}", file=sys.stderr)
-        verification["all_replacements_confirmed"] = False
+    if not dry_run:
+        try:
+            output_text = get_text(output_path)
+            verification["output_text_preview"] = output_text[:500]
+            for edit in params["edits"]:
+                replace_str = edit["replace"]
+                if not replace_str:
+                    continue  # Empty replacement — skip
+                if replace_str not in output_text:
+                    verification["all_replacements_confirmed"] = False
+                    verification["unconfirmed"].append(replace_str)
+        except Exception as e:
+            print(f"Verification warning: {e}", file=sys.stderr)
+            verification["all_replacements_confirmed"] = False
+    else:
+        verification["output_text_preview"] = "(dry_run — no file written)"
 
     return {
+        "dry_run": dry_run,
         "results": mapped,
         "summary": {
             "total": len(results),
@@ -231,7 +274,8 @@ def handle_batch_replace(params):
 
 def handle_get_fonts(params):
     pdf_path = params["pdf_path"]
-    fonts = get_fonts(pdf_path)
+    page = params.get("page")
+    fonts = get_fonts(pdf_path, page=page) if page is not None else get_fonts(pdf_path)
     return {
         "fonts": [
             {
@@ -320,14 +364,17 @@ def handle_inspect(params):
     fonts = [
         {
             "name": f.name,
+            "postscript_name": f.postscript_name,
             "encoding_type": f.encoding_type,
             "is_subset": f.is_subset,
+            "glyph_count": f.glyph_count,
+            "embedded_type": f.embedded_type,
         }
         for f in fonts_raw
     ]
 
     # Get page count
-    with pikepdf.open(pdf_path) as pdf:
+    with _translate_pikepdf(pdf_path), pikepdf.open(pdf_path) as pdf:
         page_count = len(pdf.pages)
 
     # Detect paragraphs on ALL pages (max 20 to prevent timeouts)
@@ -412,32 +459,18 @@ def handle_update_annotation(params):
     new_url = params["url"]
     output_path = params["output_path"]
 
-    with pikepdf.open(pdf_path) as pdf:
-        if page_num < 0 or page_num >= len(pdf.pages):
-            raise PDFEditError(
-                f"Page {page_num} out of range (PDF has {len(pdf.pages)} pages)"
-            )
-        page = pdf.pages[page_num]
-        annots = page.get("/Annots")
-        if annots is None:
-            raise PDFEditError("Page has no annotations")
-        if annotation_index < 0 or annotation_index >= len(annots):
-            raise PDFEditError(
-                f"Annotation index {annotation_index} out of range "
-                f"(page has {len(annots)} annotations)"
-            )
-        annot = annots[annotation_index]
-        if hasattr(annot, "resolve"):
-            annot = annot.resolve()
-        a_dict = annot.get("/A")
-        if a_dict is None:
-            raise PDFEditError("Annotation has no /A dictionary")
-        if hasattr(a_dict, "resolve"):
-            a_dict = a_dict.resolve()
-        old_url = str(a_dict.get("/URI", ""))
-        a_dict[pikepdf.Name("/URI")] = pikepdf.String(new_url)
-        pdf.save(output_path)
+    annots = get_annotations(pdf_path, page=page_num)
+    if not annots:
+        raise PDFEditError(f"Page {page_num} has no annotations")
+    if annotation_index < 0 or annotation_index >= len(annots):
+        raise PDFEditError(
+            f"Annotation index {annotation_index} out of range "
+            f"(page has {len(annots)} annotations)"
+        )
 
+    annot = annots[annotation_index]
+    old_url = annot.uri or ""
+    update_annotation_uri(pdf_path, annot, new_url, output_path)
     return {"success": True, "old_url": old_url, "new_url": new_url}
 
 
@@ -448,13 +481,14 @@ def handle_replace_single(params):
     replacement = params["replacement"]
     output_path = params["output_path"]
     reflow = params.get("reflow", True)
+    dry_run = params.get("dry_run", False)
 
     matches = find(pdf_path, search)
     if not matches:
         return {
             "success": False,
             "message": "No matches found",
-            "fidelity": {"font_preserved": True, "overflow_detected": False},
+            "dry_run": dry_run,
         }
 
     if match_index < 0 or match_index >= len(matches):
@@ -463,15 +497,13 @@ def handle_replace_single(params):
             f"(found {len(matches)} match{'es' if len(matches) != 1 else ''})"
         )
 
-    result = replace(pdf_path, matches[match_index], replacement, output_path, reflow=reflow)
-
-    return {
-        "success": result.success,
-        "fidelity": {
-            "font_preserved": result.fidelity_report.font_preserved,
-            "overflow_detected": result.fidelity_report.overflow_detected,
-        },
-    }
+    result = replace(
+        pdf_path, matches[match_index], replacement, output_path,
+        reflow=reflow, dry_run=dry_run,
+    )
+    serialized = _serialize_edit_result(result)
+    serialized["dry_run"] = dry_run
+    return serialized
 
 
 def handle_replace_block(params):
@@ -487,6 +519,8 @@ def handle_replace_block(params):
         kwargs["font_name"] = params["font_name"]
     if params.get("font_size") is not None:
         kwargs["font_size"] = params["font_size"]
+    if params.get("line_height") is not None:
+        kwargs["line_height"] = params["line_height"]
 
     result = replace_block(pdf_path, page, bbox_tuple, new_text, output_path, **kwargs)
     return _serialize_edit_result(result)
@@ -523,7 +557,13 @@ def handle_batch_replace_block(params):
         bbox_tuple = (bbox["x0"], bbox["y0"], bbox["x1"], bbox["y1"])
         replacements.append((bbox_tuple, r["new_text"]))
 
-    results = batch_replace_block(pdf_path, page_number, replacements, output_path)
+    kwargs = {}
+    if params.get("line_height") is not None:
+        kwargs["line_height"] = params["line_height"]
+    if params.get("section_gap") is not None:
+        kwargs["section_gap"] = params["section_gap"]
+
+    results = batch_replace_block(pdf_path, page_number, replacements, output_path, **kwargs)
     return {
         "results": [_serialize_edit_result(r) for r in results],
         "summary": {
@@ -747,7 +787,7 @@ def _transfer_annotations(output_path, page, bbox_a, bbox_b, annots_a, annots_b)
     """Remove annotations in both bboxes, re-add them at swapped positions."""
     y_offset = bbox_a["y1"] - bbox_b["y1"]  # b→a: shift up by this
 
-    with pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
+    with _translate_pikepdf(output_path), pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
         page_obj = pdf.pages[page]
         annots_key = pikepdf.Name("/Annots")
         rect_key = pikepdf.Name("/Rect")
@@ -900,7 +940,7 @@ def handle_swap_sections(params):
     if total_annots > 0:
         y_offset = match_a["bbox"]["y1"] - match_b["bbox"]["y1"]
 
-        with pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
+        with _translate_pikepdf(output_path), pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
             page_obj = pdf.pages[page]
             annots_key = pikepdf.Name("/Annots")
             rect_key = pikepdf.Name("/Rect")
@@ -1296,8 +1336,28 @@ METHODS = {
 
 # ── Main loop ─────────────────────────────────────────────────────────
 
+def _emit_engine_version_warning():
+    """Soft warning if engine is older than v0.1.2 (lacks v0.1.2 fidelity fields)."""
+    if _engine_version == "unknown":
+        return
+    parts = _engine_version.split(".")[:3]
+    try:
+        triple = tuple(int(p) for p in parts)
+    except ValueError:
+        return
+    if triple < (0, 1, 2):
+        print(
+            f"WARNING: pdf-edit-engine v{_engine_version} is older than v0.1.2 — "
+            "fidelity reports will lack font_substituted and glyphs_missing. "
+            "Run: pip install --upgrade 'pdf-edit-engine>=0.1.2'",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def main():
-    print("ready", file=sys.stderr, flush=True)
+    print(f"ready (engine v{_engine_version})", file=sys.stderr, flush=True)
+    _emit_engine_version_warning()
 
     for line in sys.stdin:
         line = line.strip()

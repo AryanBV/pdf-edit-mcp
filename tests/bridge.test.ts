@@ -61,12 +61,12 @@ describe("bridge.py integration tests", () => {
 
     rl = createInterface({ input: proc.stdout! });
 
-    // Wait for "ready" on stderr
+    // Wait for "ready" on stderr (banner may include engine version: "ready (engine v0.1.2)")
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("Bridge startup timed out")), 10000);
       const stderrRl = createInterface({ input: proc.stderr! });
       stderrRl.on("line", (line: string) => {
-        if (line === "ready") {
+        if (line.startsWith("ready")) {
           clearTimeout(timeout);
           resolve();
         }
@@ -160,6 +160,17 @@ describe("bridge.py integration tests", () => {
       const fidelity = res.result!.fidelity as Record<string, unknown>;
       expect(typeof fidelity.font_preserved).toBe("boolean");
       expect(typeof fidelity.overflow_detected).toBe("boolean");
+      expect("any_substitution" in fidelity).toBe(true);
+
+      // v0.1.1: per-result detail with full FidelityReport shape
+      const results = res.result!.results as Array<Record<string, unknown>>;
+      expect(Array.isArray(results)).toBe(true);
+      expect(results.length).toBeGreaterThan(0);
+      const perResultFidelity = results[0].fidelity as Record<string, unknown>;
+      expect("font_substituted" in perResultFidelity).toBe(true);
+      expect("glyphs_missing" in perResultFidelity).toBe(true);
+      expect(Array.isArray(perResultFidelity.glyphs_missing)).toBe(true);
+
       expect(existsSync(outputPath)).toBe(true);
     } finally {
       if (existsSync(outputPath)) unlinkSync(outputPath);
@@ -427,6 +438,10 @@ describe("bridge.py integration tests", () => {
       const fidelity = res.result!.fidelity as Record<string, unknown>;
       expect(typeof fidelity.font_preserved).toBe("boolean");
       expect(typeof fidelity.overflow_detected).toBe("boolean");
+      // v0.1.1: full FidelityReport shape
+      expect("font_substituted" in fidelity).toBe(true);
+      expect("reflow_applied" in fidelity).toBe(true);
+      expect(Array.isArray(fidelity.glyphs_missing)).toBe(true);
 
       // Verify the replacement text appears in output (may be line-wrapped)
       const textRes = await call("get_text", { pdf_path: outputPath });
@@ -518,6 +533,44 @@ describe("bridge.py integration tests", () => {
       expect(typeof fidelity.font_preserved).toBe("boolean");
       expect(typeof fidelity.overflow_detected).toBe("boolean");
       expect(typeof fidelity.reflow_applied).toBe("boolean");
+      // v0.1.1: full FidelityReport shape
+      expect("font_substituted" in fidelity).toBe(true);
+      expect(Array.isArray(fidelity.glyphs_missing)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("batch_replace_block forwards line_height and section_gap kwargs", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_batch_block_lh.pdf");
+    try {
+      const detectRes = await call("detect_paragraphs", {
+        pdf_path: STRUCTURED_PDF,
+        page: 0,
+      });
+      const paragraphs = detectRes.result!.paragraphs as Array<Record<string, unknown>>;
+      const bbox1 = paragraphs[0].bbox as Record<string, number>;
+      const bbox2 = paragraphs[1]?.bbox as Record<string, number> | undefined;
+
+      const replacements: Array<{ bbox: Record<string, number>; new_text: string }> = [
+        { bbox: bbox1, new_text: "Line height test" },
+      ];
+      if (bbox2) replacements.push({ bbox: bbox2, new_text: "Second block" });
+
+      const res = await call("batch_replace_block", {
+        pdf_path: STRUCTURED_PDF,
+        page_number: 0,
+        replacements,
+        output_path: outputPath,
+        line_height: 14,
+        section_gap: 6,
+      });
+      // The kwargs flow through to engine; engine accepts them in v0.1.2.
+      // We only assert the call doesn't error. If the engine ever rejects
+      // these names, we'd see a JSON-RPC error here — that's the regression
+      // signal we want.
+      expect(res.error).toBeUndefined();
+      expect(res.result).toBeDefined();
     } finally {
       if (existsSync(outputPath)) unlinkSync(outputPath);
     }
@@ -635,5 +688,134 @@ describe("bridge.py integration tests", () => {
 
     // Cleanup in case the operation did produce a file
     if (existsSync(outputPath)) unlinkSync(outputPath);
+  });
+
+  // ── v0.1.1: dry_run preview (no file written) ──
+
+  it("replace_text dry_run=true returns results without writing the output PDF", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_dry_run_should_not_exist.pdf");
+    // Make sure no stale file exists from a prior run
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+
+    const res = await call("replace_text", {
+      pdf_path: FIXTURE_PDF,
+      search: "Test",
+      replacement: "Demo",
+      output_path: outputPath,
+      dry_run: true,
+    });
+    expect(res.error).toBeUndefined();
+    expect(res.result!.dry_run).toBe(true);
+    // Per-result fidelity should still be populated even on dry_run.
+    const results = res.result!.results as Array<Record<string, unknown>>;
+    expect(Array.isArray(results)).toBe(true);
+    expect(results.length).toBeGreaterThan(0);
+    // CRITICAL: no file must have been written.
+    expect(existsSync(outputPath)).toBe(false);
+  });
+
+  it("batch_replace dry_run=true skips verification step gracefully", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_batch_dry_run.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+
+    const res = await call("batch_replace", {
+      pdf_path: FIXTURE_PDF,
+      edits: [{ find: "Test", replace: "Demo" }],
+      output_path: outputPath,
+      dry_run: true,
+    });
+    expect(res.error).toBeUndefined();
+    expect(res.result!.dry_run).toBe(true);
+    const verification = res.result!.verification as Record<string, unknown>;
+    // Verification should signal that no output was written.
+    expect(String(verification.output_text_preview)).toContain("dry_run");
+    expect(existsSync(outputPath)).toBe(false);
+  });
+
+  // ── v0.1.1: page filter on read tools ──
+
+  it("get_text with page=0 returns text from page 0 only", async () => {
+    const res = await call("get_text", { pdf_path: FIXTURE_PDF, page: 0 });
+    expect(res.error).toBeUndefined();
+    expect(typeof res.result!.text).toBe("string");
+    expect(typeof res.result!.page_count).toBe("number");
+  });
+
+  it("find_text with page=0 limits the match list to that page", async () => {
+    const res = await call("find_text", {
+      pdf_path: FIXTURE_PDF,
+      search: "Test",
+      page: 0,
+    });
+    expect(res.error).toBeUndefined();
+    const matches = res.result!.matches as Array<Record<string, unknown>>;
+    // All returned matches must be on page 0.
+    for (const m of matches) {
+      expect(m.page).toBe(0);
+    }
+  });
+
+  it("get_fonts with page=0 lists fonts used on that page only", async () => {
+    const res = await call("get_fonts", { pdf_path: FIXTURE_PDF, page: 0 });
+    expect(res.error).toBeUndefined();
+    const fonts = res.result!.fonts as Array<Record<string, unknown>>;
+    expect(Array.isArray(fonts)).toBe(true);
+  });
+
+  // ── v0.1.1: pdf_inspect font detail enrichment ──
+
+  it("inspect surfaces full FontInfo shape (postscript_name, glyph_count, embedded_type)", async () => {
+    const res = await call("inspect", {
+      pdf_path: FIXTURE_PDF,
+      include_layout: false,
+    });
+    expect(res.error).toBeUndefined();
+    const fonts = res.result!.fonts as Array<Record<string, unknown>>;
+    expect(Array.isArray(fonts)).toBe(true);
+    if (fonts.length > 0) {
+      const f = fonts[0];
+      expect("postscript_name" in f).toBe(true);
+      expect("glyph_count" in f).toBe(true);
+      expect("embedded_type" in f).toBe(true);
+    }
+  });
+
+  // ── v0.1.1: encrypted-PDF leak check (no raw pikepdf exceptions) ──
+
+  it("encrypted PDFs return PDFEditError, not raw pikepdf.PasswordError", async () => {
+    const encryptedPath = resolve(__dirname, "fixtures", "test_encrypted.pdf");
+    try {
+      // Build an encrypted fixture from a known-good source.
+      const encRes = await call("encrypt", {
+        pdf_path: FIXTURE_PDF,
+        owner_password: "ownerpass",
+        user_password: "userpass",
+        output_path: encryptedPath,
+      });
+      expect(encRes.error).toBeUndefined();
+      expect(existsSync(encryptedPath)).toBe(true);
+
+      // Every read/edit path that goes through bridge.py must translate
+      // pikepdf exceptions to PDFEditError. With v0.1.1, every direct
+      // pikepdf.open() in bridge.py is wrapped via _translate_pikepdf,
+      // and update_annotation now routes through the engine entirely.
+      const probes = [
+        { method: "get_text", params: { pdf_path: encryptedPath } },
+        {
+          method: "inspect",
+          params: { pdf_path: encryptedPath, include_layout: false },
+        },
+      ];
+
+      for (const { method, params } of probes) {
+        const res = await call(method, params);
+        expect(res.error).toBeDefined();
+        // Message must NOT contain raw pikepdf class names — the leak signal.
+        expect(res.error!.message).not.toMatch(/PasswordError/);
+        expect(res.error!.message).not.toMatch(/PdfError/);
+      }
+    } finally {
+      if (existsSync(encryptedPath)) unlinkSync(encryptedPath);
+    }
   });
 });

@@ -58,6 +58,12 @@ export const editsArraySchema = z
 export const getTextInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Limit extraction to this 0-indexed page. Omit to extract all pages."),
   })
   .strict();
 
@@ -70,6 +76,12 @@ export const findTextInputSchema = z
       .optional()
       .default(true)
       .describe("Whether the search is case-sensitive (default: true)"),
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Limit search to this 0-indexed page. Omit to search all pages."),
   })
   .strict();
 
@@ -84,6 +96,15 @@ export const replaceTextInputSchema = z
       .optional()
       .default(true)
       .describe("Whether to reflow text if replacement is wider (default: true)"),
+    dry_run: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "If true, simulate the edit and return the EditResult without writing the output PDF. " +
+          "Use to preview fidelity (font_substituted, glyphs_missing, warnings) before committing. " +
+          "output_path is still required by schema but its file is not written."
+      ),
   })
   .strict();
 
@@ -92,12 +113,26 @@ export const batchReplaceInputSchema = z
     pdf_path: pdfPathSchema,
     edits: editsArraySchema,
     output_path: outputPathSchema,
+    dry_run: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "If true, simulate all edits and return the per-edit EditResult list without writing. " +
+          "Useful for previewing batch fidelity before committing. output_path is still required."
+      ),
   })
   .strict();
 
 export const getFontsInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Limit listing to this 0-indexed page. Omit to list fonts across the whole PDF."),
   })
   .strict();
 
@@ -150,6 +185,14 @@ export const replaceSingleInputSchema = z
       .optional()
       .default(true)
       .describe("Whether to reflow text if replacement is wider (default: true)"),
+    dry_run: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "If true, simulate the edit and return the EditResult without writing the output PDF. " +
+          "output_path is still required by schema but its file is not written."
+      ),
   })
   .strict();
 
@@ -226,6 +269,16 @@ export const replaceBlockInputSchema = z
       .max(1000)
       .optional()
       .describe("Font size override (uses detected size if omitted)"),
+    line_height: z
+      .number()
+      .min(0.5)
+      .max(1000)
+      .optional()
+      .describe(
+        "Explicit line-height for the rewritten block in PDF points (engine v0.1.2+). " +
+          "Overrides the auto-calculated line height. Use to enforce uniform spacing " +
+          "across sibling blocks."
+      ),
   })
   .strict();
 
@@ -292,6 +345,25 @@ export const batchReplaceBlockInputSchema = z
       .max(50, "Maximum 50 replacements per batch")
       .describe("Array of {bbox, new_text} replacements to apply"),
     output_path: outputPathSchema,
+    line_height: z
+      .number()
+      .min(0.5)
+      .max(1000)
+      .optional()
+      .describe(
+        "Explicit line-height for every rewritten block in PDF points (engine v0.1.2+). " +
+          "Use to enforce uniform line spacing across sibling sections being swapped."
+      ),
+    section_gap: z
+      .number()
+      .min(0)
+      .max(1000)
+      .optional()
+      .describe(
+        "Vertical gap (in PDF points) between consecutive replaced sections " +
+          "(engine v0.1.2+). Overrides the original inter-section gap; useful " +
+          "when section heights change after replacement."
+      ),
   })
   .strict();
 
