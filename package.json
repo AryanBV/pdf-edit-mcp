@@ -21,7 +21,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
-    "audit": "npm audit --production --audit-level=high"
+    "audit": "npm audit --production --audit-level=high",
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "mcp",
