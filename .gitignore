@@ -145,3 +145,6 @@ demo_output/
 __pycache__/
 tests/stress_output/
 tests/fixtures/*.pdf
+
+# Release artifacts (one-shot helper files for `gh release create`)
+.release-notes-*.md
