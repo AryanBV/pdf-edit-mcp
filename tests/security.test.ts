@@ -55,12 +55,20 @@ describe("String length limits", () => {
     expect(result.success).toBe(false);
   });
 
-  it("editSchema.replace rejects string over 50,000 chars", () => {
+  it("editSchema.replace rejects string over 100,000 chars (MAX_REPLACEMENT_TEXT)", () => {
     const result = editSchema.safeParse({
       find: "x",
-      replace: "y".repeat(50_001),
+      replace: "y".repeat(100_001),
     });
     expect(result.success).toBe(false);
+  });
+
+  it("editSchema.replace accepts strings up to 100,000 chars (CR-2 standardization)", () => {
+    const result = editSchema.safeParse({
+      find: "x",
+      replace: "y".repeat(100_000),
+    });
+    expect(result.success).toBe(true);
   });
 
   it("encryptInputSchema rejects password over 128 chars", () => {

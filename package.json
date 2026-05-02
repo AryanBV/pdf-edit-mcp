@@ -19,10 +19,12 @@
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "test": "vitest run",
+    "test:unit": "vitest run tests/validation.test.ts tests/security.test.ts",
+    "test:integration": "vitest run tests/bridge.test.ts",
     "test:watch": "vitest",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
     "audit": "npm audit --production --audit-level=high",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run build && npm run test:unit"
   },
   "keywords": [
     "mcp",

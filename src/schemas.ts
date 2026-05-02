@@ -1,5 +1,16 @@
 import { z } from "zod";
 
+// S-2: Windows reserved device names. On Windows, opening C:/output/NUL.pdf
+// silently writes to the null device; CON.pdf writes to the console (which
+// would corrupt this MCP server's stdout JSON-RPC stream). Reject any path
+// whose final basename starts with one of these names (with or without
+// .pdf extension) before it can reach pikepdf.
+const WINDOWS_RESERVED_RE = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i;
+const isReservedName = (p: string): boolean => {
+  const basename = p.split(/[/\\]/).pop() ?? "";
+  return WINDOWS_RESERVED_RE.test(basename);
+};
+
 /** Absolute path to a PDF file (Windows or Unix). */
 export const pdfPathSchema = z
   .string()
@@ -13,6 +24,9 @@ export const pdfPathSchema = z
   })
   .refine((p) => !/(^|[\\/])\.\.([\\/]|$)/.test(p), {
     message: "Path must not contain directory traversal (..)",
+  })
+  .refine((p) => !isReservedName(p), {
+    message: "Path must not use a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)",
   })
   .describe("Absolute path to the PDF file");
 
@@ -30,6 +44,9 @@ export const outputPathSchema = z
   .refine((p) => !/(^|[\\/])\.\.([\\/]|$)/.test(p), {
     message: "Path must not contain directory traversal (..)",
   })
+  .refine((p) => !isReservedName(p), {
+    message: "Path must not use a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)",
+  })
   .describe("Absolute path for the output PDF file");
 
 /** Non-empty search text. */
@@ -39,11 +56,15 @@ export const searchSchema = z
   .max(10_000, "Search text exceeds maximum length (10,000 chars)")
   .describe("Text to search for in the PDF");
 
+/** Max replacement / new-text length in characters — standardized across
+ *  every text-replacement field for predictable LLM caller behavior. */
+export const MAX_REPLACEMENT_TEXT = 100_000;
+
 /** A single find/replace edit pair. */
 export const editSchema = z
   .object({
     find: z.string().min(1, "Find text must not be empty").max(10_000),
-    replace: z.string().max(50_000),
+    replace: z.string().max(MAX_REPLACEMENT_TEXT),
   })
   .strict();
 
@@ -89,7 +110,7 @@ export const replaceTextInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
     search: searchSchema,
-    replacement: z.string().max(50_000).describe("Replacement text"),
+    replacement: z.string().max(MAX_REPLACEMENT_TEXT).describe("Replacement text"),
     output_path: outputPathSchema,
     reflow: z
       .boolean()
@@ -178,7 +199,7 @@ export const replaceSingleInputSchema = z
       .optional()
       .default(0)
       .describe("Index of the match to replace (default: 0, the first match)"),
-    replacement: z.string().max(50_000).describe("Replacement text"),
+    replacement: z.string().max(MAX_REPLACEMENT_TEXT).describe("Replacement text"),
     output_path: outputPathSchema,
     reflow: z
       .boolean()
@@ -334,11 +355,24 @@ export const blockReplacementSchema = z
 export const batchReplaceBlockInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
+    // CR-9: `page` is the canonical name; `page_number` is a deprecated
+    // alias kept for v0.1.0 callers. At least one must be supplied; if
+    // both are, `page` wins. Aim is to converge to `page` only in v0.2.x.
+    page: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("0-indexed page number (preferred name)"),
     page_number: z
       .number()
       .int()
       .min(0)
-      .describe("0-indexed page number"),
+      .optional()
+      .describe(
+        "0-indexed page number (DEPRECATED alias for `page` — kept for " +
+          "v0.1.0 backward compatibility, will be removed in v0.2.0)"
+      ),
     replacements: z
       .array(blockReplacementSchema)
       .min(1, "At least one replacement is required")
@@ -365,7 +399,11 @@ export const batchReplaceBlockInputSchema = z
           "when section heights change after replacement."
       ),
   })
-  .strict();
+  .strict()
+  .refine((d) => d.page !== undefined || d.page_number !== undefined, {
+    message: "Either `page` (preferred) or `page_number` (deprecated) is required",
+    path: ["page"],
+  });
 
 export const deleteBlockInputSchema = z
   .object({
@@ -581,6 +619,9 @@ export const editMetadataInputSchema = z
     pdf_path: pdfPathSchema,
     metadata: z
       .record(z.string().max(1000))
+      .refine((obj) => Object.keys(obj).length <= 50, {
+        message: "metadata may have at most 50 keys",
+      })
       .describe("Metadata fields to set (e.g. {title, author, subject, creator})"),
     output_path: outputPathSchema,
   })
@@ -650,6 +691,9 @@ export const fillFormInputSchema = z
     pdf_path: pdfPathSchema,
     field_values: z
       .record(z.string().max(10_000))
+      .refine((obj) => Object.keys(obj).length <= 500, {
+        message: "field_values may have at most 500 fields",
+      })
       .describe("Map of form field names to values"),
     output_path: outputPathSchema,
   })

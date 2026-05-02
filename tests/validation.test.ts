@@ -537,7 +537,7 @@ describe("Zod schema validation", () => {
   describe("batchReplaceBlockInputSchema", () => {
     const validInput = {
       pdf_path: "C:/docs/input.pdf",
-      page_number: 0,
+      page: 0,
       replacements: [
         {
           bbox: { x0: 50, y0: 100, x1: 500, y1: 200 },
@@ -554,6 +554,23 @@ describe("Zod schema validation", () => {
     it("accepts valid input with multiple replacements", () => {
       const result = batchReplaceBlockInputSchema.safeParse(validInput);
       expect(result.success).toBe(true);
+    });
+
+    it("accepts deprecated `page_number` alias for backward compat", () => {
+      const { page: _omit, ...rest } = validInput;
+      void _omit;
+      const result = batchReplaceBlockInputSchema.safeParse({
+        ...rest,
+        page_number: 0,
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("rejects when neither page nor page_number is supplied", () => {
+      const { page: _omit, ...rest } = validInput;
+      void _omit;
+      const result = batchReplaceBlockInputSchema.safeParse(rest);
+      expect(result.success).toBe(false);
     });
 
     it("rejects empty replacements array", () => {
@@ -576,18 +593,18 @@ describe("Zod schema validation", () => {
       expect(result.success).toBe(false);
     });
 
-    it("rejects negative page_number", () => {
+    it("rejects negative page", () => {
       const result = batchReplaceBlockInputSchema.safeParse({
         ...validInput,
-        page_number: -1,
+        page: -1,
       });
       expect(result.success).toBe(false);
     });
 
-    it("rejects non-integer page_number", () => {
+    it("rejects non-integer page", () => {
       const result = batchReplaceBlockInputSchema.safeParse({
         ...validInput,
-        page_number: 1.5,
+        page: 1.5,
       });
       expect(result.success).toBe(false);
     });

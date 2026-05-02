@@ -81,6 +81,10 @@ class BridgeProcess {
   private callQueue: Promise<unknown> = Promise.resolve();
   private queueDepth = 0;
   private static readonly MAX_QUEUE = 100;
+  // P-1: once true, every call() rejects with a deterministic fatal error
+  // instead of the bridge silently looking like a transient "not running"
+  // failure that an LLM agent would retry indefinitely.
+  private dead = false;
 
   async spawn(): Promise<void> {
     return new Promise<void>((resolveSpawn, rejectSpawn) => {
@@ -155,6 +159,16 @@ class BridgeProcess {
   }
 
   async call(method: string, params: Record<string, unknown>): Promise<unknown> {
+    // P-1: short-circuit when the bridge is permanently dead so callers
+    // (LLM agents in particular) get a deterministic fatal error rather
+    // than the silent retry loop that "Bridge process is not running"
+    // would invite.
+    if (this.dead) {
+      throw new Error(
+        "Bridge process has permanently failed (max restarts exceeded). " +
+          "Restart the MCP server to recover."
+      );
+    }
     if (this.queueDepth >= BridgeProcess.MAX_QUEUE) {
       throw new Error("Bridge call queue full — server is overloaded");
     }
@@ -219,8 +233,12 @@ class BridgeProcess {
         });
       }, delay);
     } else {
+      // P-1: trip the dead flag so subsequent call() returns a deterministic
+      // fatal error to the MCP client. Without this, the bridge appears
+      // "transiently down" forever and LLM agents retry indefinitely.
+      this.dead = true;
       console.error(
-        `bridge.py died (code ${code}), max restarts (${BridgeProcess.MAX_RESTARTS}) exceeded`
+        `bridge.py died (code ${code}), max restarts (${BridgeProcess.MAX_RESTARTS}) exceeded — bridge permanently failed`
       );
     }
   }
@@ -710,7 +728,7 @@ server.registerTool(
       openWorldHint: false,
     },
   },
-  async ({ pdf_path, page_number, replacements, output_path, line_height, section_gap }) => {
+  async ({ pdf_path, page, page_number, replacements, output_path, line_height, section_gap }) => {
     try {
       const warnings: string[] = [];
       if (output_path === pdf_path) {
@@ -718,9 +736,12 @@ server.registerTool(
           "Warning: output_path is the same as pdf_path. The original file will be overwritten."
         );
       }
+      // CR-9: `page` is canonical; `page_number` is a deprecated v0.1.0 alias.
+      // Schema's `.refine()` already guarantees at least one is set.
+      const resolvedPage = page ?? page_number;
       const params: Record<string, unknown> = {
         pdf_path,
-        page_number,
+        page: resolvedPage,
         replacements,
         output_path,
       };
@@ -997,21 +1018,35 @@ server.registerTool(
 
 // ── Wrapper tools (document operations) ─────────────────────────────
 
-// Helper for simple write tools that follow the same bridge-call pattern.
-// Uses `as never` cast because server.registerTool's strict type inference
-// doesn't propagate through generic wrappers — runtime types are correct.
+// CR-3: helper for simple write tools that follow the same bridge-call
+// pattern. The original implementation used `as Function` (banned in strict
+// lint setups) because `server.registerTool`'s overloads don't infer well
+// through a wrapper. We narrow the cast to the third-argument callback type
+// only — every other argument stays statically typed.
+type RegisterToolFn = typeof server.registerTool;
+type RegisterToolCallback = Parameters<RegisterToolFn>[2];
+
 function registerWriteTool(
   name: string,
   desc: string,
-  schema: z.ZodType,
+  schema: z.ZodObject<z.ZodRawShape>,
   bridgeMethod: string,
   paramsFn: (args: Record<string, unknown>) => Record<string, unknown>
-) {
-  (server.registerTool as Function)(
+): void {
+  const callback = (async (args: Record<string, unknown>) => {
+    try {
+      const result = await bridge.call(bridgeMethod, paramsFn(args));
+      return toolSuccess(result);
+    } catch (err) {
+      return toolError(err instanceof Error ? err.message : String(err));
+    }
+  }) as RegisterToolCallback;
+
+  server.registerTool(
     name,
     {
       description: desc,
-      inputSchema: schema,
+      inputSchema: schema.shape,
       annotations: {
         readOnlyHint: false,
         destructiveHint: true,
@@ -1019,14 +1054,7 @@ function registerWriteTool(
         openWorldHint: false,
       },
     },
-    async (args: Record<string, unknown>) => {
-      try {
-        const result = await bridge.call(bridgeMethod, paramsFn(args));
-        return toolSuccess(result);
-      } catch (err) {
-        return toolError(err instanceof Error ? err.message : String(err));
-      }
-    }
+    callback
   );
 }
 

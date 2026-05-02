@@ -472,7 +472,7 @@ describe("bridge.py integration tests", () => {
 
       const res = await call("batch_replace_block", {
         pdf_path: STRUCTURED_PDF,
-        page_number: 0,
+        page: 0,
         replacements: [
           { bbox: bbox1, new_text: "FIRST BLOCK REPLACED" },
           { bbox: bbox2, new_text: "SECOND BLOCK REPLACED" },
@@ -516,7 +516,7 @@ describe("bridge.py integration tests", () => {
 
       const res = await call("batch_replace_block", {
         pdf_path: STRUCTURED_PDF,
-        page_number: 0,
+        page: 0,
         replacements: [{ bbox, new_text: "FIDELITY CHECK" }],
         output_path: outputPath,
       });
@@ -559,7 +559,7 @@ describe("bridge.py integration tests", () => {
 
       const res = await call("batch_replace_block", {
         pdf_path: STRUCTURED_PDF,
-        page_number: 0,
+        page: 0,
         replacements,
         output_path: outputPath,
         line_height: 14,
@@ -777,6 +777,68 @@ describe("bridge.py integration tests", () => {
       expect("postscript_name" in f).toBe(true);
       expect("glyph_count" in f).toBe(true);
       expect("embedded_type" in f).toBe(true);
+    }
+  });
+
+  // ── v0.1.1: section orchestration (CR-1 — were untested before) ──
+
+  it("detect_sections returns a tree with body_font + heading_fonts", async () => {
+    const res = await call("detect_sections", {
+      pdf_path: STRUCTURED_PDF,
+      page: 0,
+      include_text: false,
+    });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toBeDefined();
+    expect(Array.isArray(res.result!.sections)).toBe(true);
+    // body_font may legitimately be null for very small fixtures; the field
+    // must exist either way.
+    expect("body_font" in res.result!).toBe(true);
+    expect(Array.isArray(res.result!.heading_fonts)).toBe(true);
+  });
+
+  it("replace_section against a non-existent name returns a list of titles", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_replace_section_missing.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("replace_section", {
+        pdf_path: STRUCTURED_PDF,
+        section: "definitely-not-a-section-name-12345",
+        new_text: "Replacement",
+        output_path: outputPath,
+        page: 0,
+      });
+      // Either an error (preferred) or success=false. Both are acceptable —
+      // what we want is "no crash, no silent wrong-section swap".
+      if (res.error) {
+        expect(res.error.message.toLowerCase()).toContain("not found");
+      }
+      expect(existsSync(outputPath)).toBe(false);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("swap_sections with two short ambiguous names rejects rather than swapping wrong sections", async () => {
+    // X-2 regression guard: previously a substring like "test" against
+    // multiple "Test ..." sections would silently match the first.
+    const outputPath = resolve(__dirname, "fixtures", "test_swap_ambiguous.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("swap_sections", {
+        pdf_path: STRUCTURED_PDF,
+        section_a: "x",  // intentionally ambiguous / too-short
+        section_b: "y",
+        output_path: outputPath,
+        page: 0,
+      });
+      // We expect an error path. The shape can vary (not_found vs ambiguous),
+      // but a SUCCESS without warning would be the silent-bug regression.
+      expect(res.error).toBeDefined();
+      // Output should not exist on the error path.
+      expect(existsSync(outputPath)).toBe(false);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
     }
   });
 

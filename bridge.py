@@ -10,9 +10,22 @@ goes to stderr. Responses use _stdout.write() exclusively.
 
 import json
 import os
+import re
 import sys
 import io
 from contextlib import contextmanager
+
+# B-2: cap per-request bytes so a no-newline / oversized client cannot OOM
+# the bridge or block readline indefinitely. 16 MiB is generous for any
+# legitimate request (Zod field caps total to <<1 MiB in practice).
+_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
+# B-1: raw-string traversal check that does NOT pre-normalize.
+# normpath collapses C:/foo/../bar.pdf to C:\bar.pdf, swallowing the
+# traversal segment before it can be detected. The Zod layer rejects
+# the raw string; this is the bridge-side mirror so direct stdin
+# (e.g., test harnesses bypassing the TS layer) gets the same gate.
+_PATH_TRAVERSAL_RE = re.compile(r"(^|[/\\])\.\.([/\\]|$)")
 
 # Wrap stdin/stdout in UTF-8 BEFORE saving references (Windows defaults to cp1252)
 sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
@@ -548,7 +561,11 @@ def handle_insert_text_block(params):
 
 def handle_batch_replace_block(params):
     pdf_path = params["pdf_path"]
-    page_number = int(params["page_number"])
+    # CR-9: accept either `page` (canonical) or `page_number` (deprecated v0.1.0 alias).
+    raw_page = params.get("page", params.get("page_number"))
+    if raw_page is None:
+        raise PDFEditError("Missing required parameter: 'page'")
+    page_number = int(raw_page)
     output_path = params["output_path"]
 
     replacements = []
@@ -783,69 +800,26 @@ def _get_link_annotations_in_bbox(pdf_path, page, bbox):
     return result
 
 
-def _transfer_annotations(output_path, page, bbox_a, bbox_b, annots_a, annots_b):
-    """Remove annotations in both bboxes, re-add them at swapped positions."""
-    y_offset = bbox_a["y1"] - bbox_b["y1"]  # b→a: shift up by this
+def _resolve_section(name, all_secs):
+    """X-2: fuzzy-match a section by name; raise if ambiguous (>1 match) or missing.
 
-    with _translate_pikepdf(output_path), pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
-        page_obj = pdf.pages[page]
-        annots_key = pikepdf.Name("/Annots")
-        rect_key = pikepdf.Name("/Rect")
-
-        # Step 1: Remove annotations whose center is in either section bbox
-        if annots_key in page_obj:
-            kept = []
-            for annot_ref in list(page_obj[annots_key]):
-                remove = False
-                try:
-                    annot = annot_ref
-                    if hasattr(annot, "resolve"):
-                        annot = annot.resolve()
-                    if isinstance(annot, pikepdf.Dictionary) and rect_key in annot:
-                        r = annot[rect_key]
-                        cy = (float(r[1]) + float(r[3])) / 2
-                        cx = (float(r[0]) + float(r[2])) / 2
-                        in_a = (bbox_a["y0"] < cy < bbox_a["y1"]
-                                and bbox_a["x0"] < cx < bbox_a["x1"])
-                        in_b = (bbox_b["y0"] < cy < bbox_b["y1"]
-                                and bbox_b["x0"] < cx < bbox_b["x1"])
-                        remove = in_a or in_b
-                except Exception as e:
-                    print(f"Annotation removal skip: {e}", file=sys.stderr)
-                if not remove:
-                    kept.append(annot_ref)
-            page_obj[annots_key] = pikepdf.Array(kept) if kept else pikepdf.Array()
-
-        # Step 2: Re-add saved annotations at swapped positions
-        if annots_key not in page_obj:
-            page_obj[annots_key] = pikepdf.Array()
-
-        def _make_link(rect_tuple, uri):
-            action = pikepdf.Dictionary({
-                "/S": pikepdf.Name("/URI"),
-                "/URI": pikepdf.String(uri),
-            })
-            return pdf.make_indirect(pikepdf.Dictionary({
-                "/Type": pikepdf.Name("/Annot"),
-                "/Subtype": pikepdf.Name("/Link"),
-                "/Rect": pikepdf.Array([float(v) for v in rect_tuple]),
-                "/Border": pikepdf.Array([0, 0, 0]),
-                "/A": action,
-            }))
-
-        # annots_a (from bbox_a) → go to bbox_b position: shift down
-        for a in annots_a:
-            new_rect = (a["rect"][0], a["rect"][1] - y_offset,
-                        a["rect"][2], a["rect"][3] - y_offset)
-            page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
-
-        # annots_b (from bbox_b) → go to bbox_a position: shift up
-        for a in annots_b:
-            new_rect = (a["rect"][0], a["rect"][1] + y_offset,
-                        a["rect"][2], a["rect"][3] + y_offset)
-            page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
-
-        pdf.save(output_path)
+    The legacy `next()` finder silently returned the first substring match
+    when the user-supplied name matched multiple sections — e.g., "software"
+    against ["Software Projects", "Software Skills"] would silently pick
+    the first. Now ambiguity is surfaced to the caller.
+    """
+    low = name.lower()
+    matches = [s for s in all_secs if low in s["title"].lower()]
+    if not matches:
+        titles = [s["title"][:40] for s in all_secs]
+        raise PDFEditError(f"Section '{name}' not found. Available: {titles}")
+    if len(matches) > 1:
+        ambiguous = [s["title"][:50] for s in matches]
+        raise PDFEditError(
+            f"Section name '{name}' is ambiguous — matches {len(matches)} sections: "
+            f"{ambiguous}. Provide a more specific substring."
+        )
+    return matches[0]
 
 
 def handle_swap_sections(params):
@@ -871,19 +845,9 @@ def handle_swap_sections(params):
     if not all_secs:
         raise PDFEditError("No sections detected in the document")
 
-    # Fuzzy-match by title
-    def find_sec(name):
-        low = name.lower()
-        return next((s for s in all_secs if low in s["title"].lower()), None)
-
-    match_a = find_sec(section_a)
-    match_b = find_sec(section_b)
-    if not match_a:
-        titles = [s["title"][:40] for s in all_secs]
-        raise PDFEditError(f"Section '{section_a}' not found. Available: {titles}")
-    if not match_b:
-        titles = [s["title"][:40] for s in all_secs]
-        raise PDFEditError(f"Section '{section_b}' not found. Available: {titles}")
+    # X-2: unique-match resolution; raises on ambiguous or missing.
+    match_a = _resolve_section(section_a, all_secs)
+    match_b = _resolve_section(section_b, all_secs)
     if match_a is match_b:
         raise PDFEditError(f"Both names match the same section: '{match_a['title'][:50]}'")
 
@@ -930,9 +894,19 @@ def handle_swap_sections(params):
         else:
             replacements.append({"bbox": sib["bbox"], "new_text": sib["text"]})
 
+    # X-1: write Phase 1 + Phase 2 to a sibling temp path; only after BOTH
+    # phases succeed, atomically rename to output_path. If anything fails,
+    # the user's output_path is untouched (no half-mutated PDF left behind).
+    temp_path = output_path + ".swap_tmp"
+    if os.path.exists(temp_path):
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
     result = handle_batch_replace_block({
-        "pdf_path": pdf_path, "page_number": page,
-        "replacements": replacements, "output_path": output_path,
+        "pdf_path": pdf_path, "page": page,
+        "replacements": replacements, "output_path": temp_path,
     })
 
     # Restore all annotations: swap pair at swapped positions, siblings at original
@@ -940,7 +914,7 @@ def handle_swap_sections(params):
     if total_annots > 0:
         y_offset = match_a["bbox"]["y1"] - match_b["bbox"]["y1"]
 
-        with _translate_pikepdf(output_path), pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
+        with _translate_pikepdf(temp_path), pikepdf.open(temp_path, allow_overwriting_input=True) as pdf:
             page_obj = pdf.pages[page]
             annots_key = pikepdf.Name("/Annots")
             rect_key = pikepdf.Name("/Rect")
@@ -990,7 +964,7 @@ def handle_swap_sections(params):
             sib_shifts = {}  # title → y_shift
             try:
                 out_det = handle_detect_sections({
-                    "pdf_path": output_path, "page": page, "include_text": False,
+                    "pdf_path": temp_path, "page": page, "include_text": False,
                 })
                 out_all = []
                 for s in out_det["sections"]:
@@ -1025,7 +999,20 @@ def handle_swap_sections(params):
                                 a["rect"][2], a["rect"][3] + dy)
                     page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
 
-            pdf.save(output_path)
+            pdf.save(temp_path)
+
+    # X-1: atomic finalization. Only NOW does the user-supplied output_path
+    # get written. If anything above raised, the temp file is orphaned but
+    # output_path is untouched. os.replace is atomic on Windows + POSIX.
+    try:
+        os.replace(temp_path, output_path)
+    except OSError as e:
+        # Best-effort cleanup of the temp before bubbling up.
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise PDFEditError(f"Failed to finalize swap output: {e}") from e
 
     return {
         "success": all(r["success"] for r in result["results"]),
@@ -1057,11 +1044,8 @@ def handle_replace_section(params):
     if not all_secs:
         raise PDFEditError("No sections detected in the document")
 
-    low = section_name.lower()
-    match = next((s for s in all_secs if low in s["title"].lower()), None)
-    if not match:
-        titles = [s["title"][:40] for s in all_secs]
-        raise PDFEditError(f"Section '{section_name}' not found. Available: {titles}")
+    # X-2: unique-match; raises on ambiguous or missing.
+    match = _resolve_section(section_name, all_secs)
 
     # Find the nearest containing section (one level up) by bbox geometry
     target_level = match["level"]
@@ -1092,7 +1076,7 @@ def handle_replace_section(params):
             replacements.append({"bbox": sib["bbox"], "new_text": sib["text"]})
 
     result = handle_batch_replace_block({
-        "pdf_path": pdf_path, "page_number": page,
+        "pdf_path": pdf_path, "page": page,
         "replacements": replacements, "output_path": output_path,
     })
 
@@ -1336,31 +1320,70 @@ METHODS = {
 
 # ── Main loop ─────────────────────────────────────────────────────────
 
-def _emit_engine_version_warning():
-    """Soft warning if engine is older than v0.1.2 (lacks v0.1.2 fidelity fields)."""
+def _check_engine_version():
+    """CR-5: hard-fail on engine < 0.1.2.
+
+    The MCP relies on FidelityReport.font_substituted, glyphs_missing,
+    and the auto-overflow warning that v0.1.2 introduced. Older engines
+    silently degrade these fields to None / [], and the MCP would
+    return responses that look complete but lack the v0.1.1 features
+    the README and tool descriptions advertise. Fail fast instead.
+
+    If the version cannot be detected (dev install, missing __version__),
+    we WARN but don't refuse — the developer is presumed to know what
+    they're doing.
+    """
     if _engine_version == "unknown":
+        print(
+            "WARNING: pdf-edit-engine version could not be detected. "
+            "v0.1.1 of the MCP requires engine >=0.1.2.",
+            file=sys.stderr,
+            flush=True,
+        )
         return
     parts = _engine_version.split(".")[:3]
     try:
         triple = tuple(int(p) for p in parts)
     except ValueError:
-        return
+        return  # non-numeric version (e.g. dev tag) — skip the check
     if triple < (0, 1, 2):
         print(
-            f"WARNING: pdf-edit-engine v{_engine_version} is older than v0.1.2 — "
-            "fidelity reports will lack font_substituted and glyphs_missing. "
-            "Run: pip install --upgrade 'pdf-edit-engine>=0.1.2'",
+            f"FATAL: pdf-edit-engine v{_engine_version} is older than the "
+            "required v0.1.2. The v0.1.1 MCP relies on fidelity fields "
+            "(font_substituted, glyphs_missing) that older engines do not "
+            "populate. Run: pip install --upgrade 'pdf-edit-engine>=0.1.2'",
             file=sys.stderr,
             flush=True,
         )
+        sys.exit(2)
 
 
 def main():
+    _check_engine_version()  # may sys.exit(2) on incompatible engine
     print(f"ready (engine v{_engine_version})", file=sys.stderr, flush=True)
-    _emit_engine_version_warning()
 
-    for line in sys.stdin:
-        line = line.strip()
+    # B-2: bound per-line reads so a malicious / buggy client cannot
+    # hang the bridge with an unterminated giant line. We read raw bytes
+    # with a hard limit, then decode once.
+    raw_stdin = sys.stdin.buffer
+    while True:
+        raw_line = raw_stdin.readline(_MAX_REQUEST_BYTES)
+        if not raw_line:
+            break  # EOF
+        if len(raw_line) >= _MAX_REQUEST_BYTES and not raw_line.endswith(b"\n"):
+            # Hit the cap without seeing a newline — drain the rest of
+            # this line so the next iteration starts at a fresh request.
+            while True:
+                tail = raw_stdin.readline(_MAX_REQUEST_BYTES)
+                if not tail or tail.endswith(b"\n"):
+                    break
+            respond_error(None, -32600, "Request exceeds 16 MiB cap")
+            continue
+        try:
+            line = raw_line.decode("utf-8").strip()
+        except UnicodeDecodeError as e:
+            respond_error(None, -32700, f"Invalid UTF-8 in request: {e}")
+            continue
         if not line:
             continue
 
@@ -1374,18 +1397,20 @@ def main():
         method = request.get("method")
         params = request.get("params", {})
 
-        # Defense-in-depth: validate all path parameters before dispatch
+        # Defense-in-depth: validate all path parameters before dispatch.
+        # B-1: raw-string check — do NOT normpath first (normpath collapses
+        # the traversal segment before the check sees it).
         path_invalid = False
         if isinstance(params, dict):
             for key, val in params.items():
                 if (key.endswith("_path") or key == "output_dir") and isinstance(val, str):
-                    if ".." in os.path.normpath(val).split(os.sep):
+                    if _PATH_TRAVERSAL_RE.search(val):
                         respond_error(req_id, -32602, f"Invalid path parameter '{key}': contains '..'")
                         path_invalid = True
                         break
                 if key == "pdf_paths" and isinstance(val, list):
                     for p in val:
-                        if isinstance(p, str) and ".." in os.path.normpath(p).split(os.sep):
+                        if isinstance(p, str) and _PATH_TRAVERSAL_RE.search(p):
                             respond_error(req_id, -32602, f"Invalid path in '{key}': contains '..'")
                             path_invalid = True
                             break
@@ -1401,7 +1426,17 @@ def main():
         try:
             result = METHODS[method](params)
             respond_success(req_id, result)
-        except (PDFEditError, FontNotFoundError) as e:
+        except OperatorError as e:
+            # CR-11: stale TextMatch — engine's INV-B-3 guard fired. Give
+            # callers a distinct error code (-32001) and a structured
+            # recovery hint so LLM agents can self-correct by re-running
+            # pdf_find_text without parsing the message string.
+            respond_error(
+                req_id,
+                -32001,
+                f"OperatorError: {e} (hint: re-run pdf_find_text, your match references are stale)",
+            )
+        except (PDFEditError, FontNotFoundError, EncodingError, ReflowError) as e:
             respond_error(req_id, -32000, f"{type(e).__name__}: {e}")
         except FileNotFoundError as e:
             respond_error(req_id, -32000, f"File not found: {getattr(e, 'filename', None) or 'unknown'}")

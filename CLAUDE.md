@@ -26,6 +26,14 @@ pdf-edit-engine (Python library)
 
 5. **Serialized bridge calls** — Only one JSON-RPC request is in-flight at a time. The TS server queues requests.
 
+6. **Engine version pin** — `bridge.py` hard-fails (`sys.exit(2)`) at startup if the installed `pdf-edit-engine` is older than `0.1.2`. The MCP relies on `FidelityReport.font_substituted` and `glyphs_missing` fields that older engines do not populate.
+
+## Tech debt — section detection lives in bridge.py
+
+`bridge.py:handle_detect_sections` (~150 LOC) implements an MCP-side font-frequency heuristic to build a section tree from `get_text_layout`. This logic could plausibly belong in `pdf_edit_engine.structural` instead — pushing it down would let non-MCP callers reuse it, and the MCP would shrink to a thin wrapper. Tracked for v0.2.x. Do not extend this MCP-side detector with significant new logic; if changes are needed, push the work into the engine first.
+
+`handle_swap_sections` and `handle_replace_section` follow the same pattern (MCP-side orchestration around engine primitives). They use `_resolve_section` for unique-match resolution (raises on ambiguous), and `handle_swap_sections` writes its output to a `.swap_tmp` sibling and atomically renames on full success.
+
 ## Configuration
 
 - `PDF_EDIT_PYTHON` env var: path to Python executable (default: `"python"`)
