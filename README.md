@@ -1,6 +1,6 @@
 # pdf-edit-mcp
 
-MCP server for format-preserving PDF text editing. Edit text in existing PDFs while preserving the original fonts, layout, and visual fidelity.
+MCP server for editing text in existing PDFs through content-stream surgery. Targets fidelity preservation (original font, exact position, in-place operators) and reports — honestly — when fidelity has to break.
 
 [![npm version](https://img.shields.io/npm/v/@aryanbv/pdf-edit-mcp)](https://www.npmjs.com/package/@aryanbv/pdf-edit-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -12,26 +12,47 @@ MCP server for format-preserving PDF text editing. Edit text in existing PDFs wh
 
 Most PDF editors use a redact-and-replace approach — they white out the original text and stamp new text on top, usually with a substitute font. The result looks different from the original.
 
-pdf-edit-mcp takes a different approach. It modifies the original PDF content stream operators directly, preserving the exact font, size, color, and position of the text being edited.
+pdf-edit-mcp takes a different approach. It modifies the original PDF content stream operators directly, preserving the exact font, size, color, and position of the text being edited — when the embedded font already contains the glyphs you need.
 
 | | Traditional approach | pdf-edit-mcp |
 |---|---|---|
 | **Method** | Redact old text, stamp new text | Modify content stream operators in place |
-| **Font** | Substituted (often Helvetica) | Original font preserved |
+| **Font** | Substituted (often Helvetica) | Original font when possible; metric-equivalent fallback (e.g. Carlito for Calibri) when not |
 | **Position** | Re-calculated | Exact original coordinates |
-| **Quality feedback** | None | FidelityReport on every edit |
+| **Quality feedback** | None | FidelityReport on every edit (font_substituted, glyphs_missing, overflow_detected, warnings) |
 
 Powered by [pdf-edit-engine](https://github.com/AryanBV/pdf-edit-engine) — a Python library for PDF content stream surgery with two-tier font subset extension.
 
+## When fidelity is exact, and when it isn't
+
+This matters more than the headline claim. The engine has three fidelity tiers, and every edit's `FidelityReport` tells you which one fired:
+
+- **Tier 1 — exact** (`font_preserved=true`, `font_substituted=null`): the embedded font already had every glyph the replacement needs. Output is byte-identical at the operator layer.
+- **Tier 1.5 — in-place injection** (`font_preserved=true`, glyph appended to embedded font): glyph wasn't in the embedded font but was in your system font with the same `unitsPerEm`. The original CIDs are preserved; only new glyphs are appended at fresh GIDs. Visual: indistinguishable from Tier 1.
+- **Metric-equivalent fallback** (`font_preserved=false`, `font_substituted="Carlito-Regular"` or similar): the original font isn't installed system-wide, so an open-source font with matching metrics substitutes for the new glyphs. Visual: very close but not pixel-perfect; spacing is right because metrics match.
+
+What straight-up fails (the engine raises, the MCP returns a structured error):
+- The font is CFF / Type 1 / Type 3 (`FontNotFoundError` — TrueType only for Tier 1.5 today).
+- The `unitsPerEm` of the system font differs from the embedded font (rescaling out of scope).
+- The replacement is wider than the available bbox AND there's no room to reflow downward (`OverflowError` surfaced via `EditResult.warnings`).
+- Multi-codepoint emoji or scripts the system fonts don't carry.
+
+If you need fidelity guarantees for a specific PDF, run `pdf_analyze_subset` first to see what tier you'll land in.
+
 ## Features
 
-- 38 tools across 7 categories (reading, text editing, block ops, section ops, annotations, document manipulation, metadata & security)
-- 3 built-in MCP prompts that guide the editing workflow step by step
-- Fidelity reporting — every edit returns whether fonts were preserved or substituted (with the substitute font name when fallback occurred), overflow detected, reflow applied, and which glyphs were missing if any
-- Batch operations — up to 500 find-and-replace edits in a single atomic call with auto-verification
-- Section intelligence — detects document structure by font hierarchy, swaps sections by fuzzy title match
-- Full document manipulation — merge, split, rotate, reorder, crop, watermark, encrypt, decrypt, fill forms
-- Runs entirely local — no external APIs, no network calls, no API keys
+- **38 tools** across 7 categories (reading, text editing, block ops, section ops, annotations, document manipulation, metadata & security)
+- **3 built-in MCP prompts** that guide the editing workflow step by step
+- **Fidelity reporting** on every edit: `font_preserved`, `font_substituted`, `overflow_detected`, `reflow_applied`, `glyphs_missing`, plus a `warnings` list (auto-includes overflow notices)
+- **`dry_run` preview** on `pdf_replace_text`, `pdf_replace_single`, `pdf_batch_replace` — return the FidelityReport without writing the output PDF, so you can verify font/glyph coverage before committing
+- **Per-page filtering** on `pdf_find_text`, `pdf_get_text`, `pdf_get_fonts` — restrict reads to a single 0-indexed page on multi-page PDFs
+- **Layout overrides** on `pdf_replace_block` and `pdf_batch_replace_block` — explicit `line_height` and `section_gap` for uniform spacing across sibling sections
+- **Batch operations** — up to 500 find-and-replace edits per call, up to 50 block replacements per page, with auto-verification on the output
+- **Section intelligence** — detects document structure by font hierarchy, swaps sections by fuzzy title match (raises on ambiguous match rather than silently picking)
+- **Atomic write** — section-swap operations write to a temp file and rename only on full success; failures leave your output path untouched
+- **Engine-version pin enforced at startup** — bridge hard-fails if `pdf-edit-engine < 0.1.2` is installed, so missing fidelity fields can't masquerade as `null`
+- **Structured error codes** — engine errors map to specific JSON-RPC codes (`-32001` stale match, `-32002` encoding, `-32003` reflow, `-32004` font-not-found) with embedded recovery hints
+- **Runs entirely local** — no external APIs, no network calls, no API keys
 
 ## Quick Start
 
@@ -210,21 +231,38 @@ pdf-edit-engine — Python library (pikepdf + fonttools + pdfminer)
 
 ## Tested PDF generators
 
-| Generator | Encoding | Character agreement |
-|-----------|----------|-------------------|
-| Chrome (Print to PDF) | Identity-H | 100% |
-| Google Docs export | Identity-H | 100% |
-| reportlab (Python) | WinAnsi | 100% |
+| Generator | Encoding | Character agreement | Notes |
+|-----------|----------|-------------------|-------|
+| Chrome (Print to PDF) | Identity-H | 100% | Narrow font subsets exercise Tier 1.5 in-place glyph injection |
+| Google Docs export | Identity-H | 100% | |
+| Microsoft Word | Identity-H (Calibri) | 100% with Carlito metric-equivalent installed | `font_substituted` set when fallback fires |
+| reportlab (Python) | WinAnsi | 100% | Synthetic test fixture |
 
 ## Limitations
 
-What v0.1.0 does not support:
+What v0.1.1 does **not** support:
 
-- Cross-page reflow (text expanding beyond a page boundary)
-- Image editing or generation
-- Table structure detection
-- Encodings beyond Identity-H and WinAnsi
-- Right-to-left text
+- **Cross-page reflow** — text expanding past a page boundary is not redistributed; you'll see an `overflow_detected: true` and a warning
+- **CFF / Type 1 / Type 3 fonts** — Tier 1.5 in-place glyph injection is TrueType only (`FontFile2` ↔ `glyf` table). Edits that need new glyphs in a CFF font return `FontNotFoundError` with code `-32004`
+- **`unitsPerEm` mismatch** — if the embedded font and your installed system font use different `unitsPerEm`, glyph rescaling is out of scope; the engine raises rather than ship distorted output
+- **Image editing or generation** — text-only
+- **Table structure detection** — text and bbox extraction work, but no table semantics
+- **Encodings beyond Identity-H and WinAnsi** — `MacRoman` and custom `/Differences` are decoded for reading but not exercised by the test fixtures
+- **Right-to-left text** — bidi reordering is not handled
+- **Multi-codepoint emoji / complex script glyphs** that aren't in your system fonts — recorded as `glyphs_missing` in the FidelityReport
+
+## Error codes
+
+JSON-RPC error codes the bridge can return (in addition to standard `-32600`/`-32601`/`-32602`):
+
+| Code | Class | Hint |
+|---|---|---|
+| `-32000` | `PDFEditError` (generic) | Inspect the message for context |
+| `-32001` | `OperatorError` | TextMatch is stale — re-run `pdf_find_text` and retry |
+| `-32002` | `EncodingError` | Run `pdf_analyze_subset` to see which characters can't encode |
+| `-32003` | `ReflowError` | Replacement may be too wide for the bbox — try shorter text |
+| `-32004` | `FontNotFoundError` | Install the original font system-wide, or accept metric-equivalent fallback |
+| `-32603` | Internal error | Bug — please report at the issue tracker |
 
 ## Troubleshooting
 
