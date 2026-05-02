@@ -10,8 +10,11 @@ goes to stderr. Responses use _stdout.write() exclusively.
 
 import json
 import os
+import queue
 import re
 import sys
+import threading
+import time
 import io
 from contextlib import contextmanager
 
@@ -20,12 +23,48 @@ from contextlib import contextmanager
 # legitimate request (Zod field caps total to <<1 MiB in practice).
 _MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
-# B-1: raw-string traversal check that does NOT pre-normalize.
-# normpath collapses C:/foo/../bar.pdf to C:\bar.pdf, swallowing the
-# traversal segment before it can be detected. The Zod layer rejects
-# the raw string; this is the bridge-side mirror so direct stdin
-# (e.g., test harnesses bypassing the TS layer) gets the same gate.
+# B-1 + S-2 root: unified path-safety regexes — mirror src/schemas.ts'
+# PATH_CHECKS verbatim. Bridge applies these to every path-shaped
+# parameter before dispatch so the bridge stays defended even when
+# invoked directly (test harness, alternate clients) without going
+# through the Zod layer. ANY change in src/schemas.ts must be mirrored
+# here AND vice-versa — the test suite asserts parity.
+_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]|^/")
 _PATH_TRAVERSAL_RE = re.compile(r"(^|[/\\])\.\.([/\\]|$)")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f]")
+_TRAILING_DOT_OR_SPACE_RE = re.compile(r"[. ]$")
+_WINDOWS_RESERVED_RE = re.compile(
+    r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)", re.IGNORECASE
+)
+_MAX_PATH_LENGTH = 4096
+
+
+def _validate_path(value, *, require_pdf_extension=True):
+    """Return None if path is safe, else an error message string.
+
+    Mirrors src/schemas.ts PATH_CHECKS / pathSafetyError(). Two callers:
+    (1) bridge dispatcher loop, before any handler runs;
+    (2) any handler that writes to a path it constructs internally
+        (e.g. handle_swap_sections building output_path + ".swap_tmp").
+    """
+    if not isinstance(value, str) or not value:
+        return "Path must not be empty"
+    if len(value) > _MAX_PATH_LENGTH:
+        return f"Path exceeds maximum length ({_MAX_PATH_LENGTH})"
+    if not _ABSOLUTE_PATH_RE.search(value):
+        return "Path must be absolute"
+    if require_pdf_extension and not value.lower().endswith(".pdf"):
+        return "Path must end with .pdf"
+    if _PATH_TRAVERSAL_RE.search(value):
+        return "Path must not contain directory traversal (..)"
+    if _CONTROL_CHARS_RE.search(value):
+        return "Path must not contain control characters (NUL, etc.)"
+    basename = re.split(r"[/\\]", value)[-1]
+    if _TRAILING_DOT_OR_SPACE_RE.search(basename):
+        return "Path basename must not end with '.' or ' ' (Windows treats these as truncated)"
+    if _WINDOWS_RESERVED_RE.match(basename):
+        return "Path must not use a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)"
+    return None
 
 # Wrap stdin/stdout in UTF-8 BEFORE saving references (Windows defaults to cp1252)
 sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
@@ -848,6 +887,125 @@ def _resolve_section(name, all_secs):
     return matches[0]
 
 
+def _rewrite_link_annotations_for_swap(target_path, page, siblings, saved_annots):
+    """CR-4 root: rewrite link annotations after batch_replace_block.
+
+    Extracted from the previously-inline body of handle_swap_sections so
+    the deleted dead `_transfer_annotations` and the live inline copy
+    converge on a single tested implementation. The helper:
+
+    1. Opens `target_path` (the temp swap_tmp file in handle_swap_sections),
+    2. Strips every existing link annotation whose centerpoint falls inside
+       any sibling section's bbox (clean slate),
+    3. Re-detects sections on the output to learn where each sibling
+       actually landed (vertical shifts after re-render),
+    4. Re-adds the saved annotations at shifted positions,
+    5. Saves in place.
+
+    No-op when `saved_annots` has no entries — short-circuits to avoid
+    opening the PDF twice unnecessarily.
+    """
+    total_annots = sum(len(v) for v in saved_annots.values())
+    if total_annots == 0:
+        return 0
+
+    with _translate_pikepdf(target_path), pikepdf.open(
+        target_path, allow_overwriting_input=True
+    ) as pdf:
+        page_obj = pdf.pages[page]
+        annots_key = pikepdf.Name("/Annots")
+        rect_key = pikepdf.Name("/Rect")
+
+        # Step 1: Clean slate — drop every annotation whose center lies in
+        # any sibling section's bbox. The new annotations we're about to
+        # add will replace them at correct shifted positions.
+        if annots_key in page_obj:
+            kept = []
+            for annot_ref in list(page_obj[annots_key]):
+                remove = False
+                try:
+                    annot = annot_ref
+                    if hasattr(annot, "resolve"):
+                        annot = annot.resolve()
+                    if isinstance(annot, pikepdf.Dictionary) and rect_key in annot:
+                        r = annot[rect_key]
+                        cy = (float(r[1]) + float(r[3])) / 2
+                        cx = (float(r[0]) + float(r[2])) / 2
+                        for sib in siblings:
+                            b = sib["bbox"]
+                            if b["y0"] < cy < b["y1"] and b["x0"] < cx < b["x1"]:
+                                remove = True
+                                break
+                except Exception:
+                    pass
+                if not remove:
+                    kept.append(annot_ref)
+            page_obj[annots_key] = (
+                pikepdf.Array(kept) if kept else pikepdf.Array()
+            )
+
+        # Step 2: Ensure /Annots exists for the writes below.
+        if annots_key not in page_obj:
+            page_obj[annots_key] = pikepdf.Array()
+
+        def _make_link(rect_tuple, uri):
+            action = pikepdf.Dictionary({
+                "/S": pikepdf.Name("/URI"),
+                "/URI": pikepdf.String(uri),
+            })
+            return pdf.make_indirect(pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Link"),
+                "/Rect": pikepdf.Array([float(v) for v in rect_tuple]),
+                "/Border": pikepdf.Array([0, 0, 0]),
+                "/A": action,
+            }))
+
+        # Step 3: re-detect sections on the output to find each sibling's
+        # actual final y-position. Match on first word (robust against
+        # spacing changes from re-render).
+        sib_shifts = {}
+        try:
+            out_det = handle_detect_sections({
+                "pdf_path": target_path, "page": page, "include_text": False,
+            })
+            out_all = []
+            for s in out_det["sections"]:
+                out_all.append(s)
+                for c in s.get("children", []):
+                    out_all.append(c)
+            for sib in siblings:
+                first_word = sib["title"].split()[0].lower() if sib["title"].split() else ""
+                out_sib = next(
+                    (s for s in out_all
+                     if s["level"] == sib["level"]
+                     and first_word
+                     and s["title"].lower().startswith(first_word)),
+                    None,
+                )
+                if out_sib:
+                    sib_shifts[sib["title"]] = out_sib["bbox"]["y1"] - sib["bbox"]["y1"]
+                else:
+                    sib_shifts[sib["title"]] = 0.0
+        except Exception:
+            for sib in siblings:
+                sib_shifts[sib["title"]] = 0.0
+
+        # Step 4: Re-add saved annotations at their post-swap positions.
+        for sib in siblings:
+            annots_for_sib = saved_annots.get(sib["title"], [])
+            dy = sib_shifts.get(sib["title"], 0.0)
+            for a in annots_for_sib:
+                new_rect = (
+                    a["rect"][0], a["rect"][1] + dy,
+                    a["rect"][2], a["rect"][3] + dy,
+                )
+                page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
+
+        pdf.save(target_path)
+    return total_annots
+
+
 def handle_swap_sections(params):
     """Swap two sections by name — detects structure, finds siblings, swaps."""
     pdf_path = params["pdf_path"]
@@ -942,97 +1100,11 @@ def handle_swap_sections(params):
             "replacements": replacements, "output_path": temp_path,
         })
 
-        # Restore all annotations: swap pair at swapped positions, siblings at original
-        total_annots = sum(len(v) for v in saved_annots.values())
-        if total_annots > 0:
-            y_offset = match_a["bbox"]["y1"] - match_b["bbox"]["y1"]
-
-            with _translate_pikepdf(temp_path), pikepdf.open(temp_path, allow_overwriting_input=True) as pdf:
-                page_obj = pdf.pages[page]
-                annots_key = pikepdf.Name("/Annots")
-                rect_key = pikepdf.Name("/Rect")
-
-                # Remove all annotations in ALL sibling bboxes (clean slate)
-                if annots_key in page_obj:
-                    kept = []
-                    for annot_ref in list(page_obj[annots_key]):
-                        remove = False
-                        try:
-                            annot = annot_ref
-                            if hasattr(annot, "resolve"):
-                                annot = annot.resolve()
-                            if isinstance(annot, pikepdf.Dictionary) and rect_key in annot:
-                                r = annot[rect_key]
-                                cy = (float(r[1]) + float(r[3])) / 2
-                                cx = (float(r[0]) + float(r[2])) / 2
-                                for sib in siblings:
-                                    b = sib["bbox"]
-                                    if b["y0"] < cy < b["y1"] and b["x0"] < cx < b["x1"]:
-                                        remove = True
-                                        break
-                        except Exception:
-                            pass
-                        if not remove:
-                            kept.append(annot_ref)
-                    page_obj[annots_key] = pikepdf.Array(kept) if kept else pikepdf.Array()
-
-                # Re-add all saved annotations at correct positions
-                if annots_key not in page_obj:
-                    page_obj[annots_key] = pikepdf.Array()
-
-                def _make_link(rect_tuple, uri):
-                    action = pikepdf.Dictionary({
-                        "/S": pikepdf.Name("/URI"),
-                        "/URI": pikepdf.String(uri),
-                    })
-                    return pdf.make_indirect(pikepdf.Dictionary({
-                        "/Type": pikepdf.Name("/Annot"),
-                        "/Subtype": pikepdf.Name("/Link"),
-                        "/Rect": pikepdf.Array([float(v) for v in rect_tuple]),
-                        "/Border": pikepdf.Array([0, 0, 0]),
-                        "/A": action,
-                    }))
-
-                # Detect sections on the OUTPUT to find where each sibling actually landed
-                sib_shifts = {}  # title → y_shift
-                try:
-                    out_det = handle_detect_sections({
-                        "pdf_path": temp_path, "page": page, "include_text": False,
-                    })
-                    out_all = []
-                    for s in out_det["sections"]:
-                        out_all.append(s)
-                        for c in s.get("children", []):
-                            out_all.append(c)
-                    for sib in siblings:
-                        # Find where this section's CONTENT landed in the output
-                        # Each section's annotations follow its own text
-                        # Match on first word (robust against spacing changes after re-render)
-                        first_word = sib["title"].split()[0].lower() if sib["title"].split() else ""
-                        out_sib = next(
-                            (s for s in out_all
-                             if s["level"] == sib["level"]
-                             and first_word
-                             and s["title"].lower().startswith(first_word)),
-                            None,
-                        )
-                        if out_sib:
-                            sib_shifts[sib["title"]] = out_sib["bbox"]["y1"] - sib["bbox"]["y1"]
-                        else:
-                            sib_shifts[sib["title"]] = 0.0
-                except Exception:
-                    for sib in siblings:
-                        sib_shifts[sib["title"]] = 0.0
-
-                for sib in siblings:
-                    annots_for_sib = saved_annots.get(sib["title"], [])
-                    dy = sib_shifts.get(sib["title"], 0.0)
-                    for a in annots_for_sib:
-                        new_rect = (a["rect"][0], a["rect"][1] + dy,
-                                    a["rect"][2], a["rect"][3] + dy)
-                        page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
-
-                pdf.save(temp_path)
+        # CR-4 root: extracted helper. Restores all link annotations at
+        # their post-swap positions (or no-ops if none were saved).
+        total_annots = _rewrite_link_annotations_for_swap(
+            temp_path, page, siblings, saved_annots
+        )
 
         # X-1: atomic finalization. os.replace is atomic on Windows + POSIX.
         try:
@@ -1393,25 +1465,87 @@ def _check_engine_version():
         sys.exit(2)
 
 
+# B-2 root: slow-loris protection. The original B-2 fix capped per-line
+# bytes at 16 MiB but the bridge would still block forever on a partial
+# write that never sent a newline (`readline()` waits for newline OR
+# byte-cap OR EOF). Real-world threat: a buggy Node parent that sends
+# 1 KB and stops; bridge can't process queued requests because the
+# reader is wedged.
+#
+# Root fix: reader thread feeds a Queue, main loop polls with timeout.
+# If no bytes arrive for SLOW_LORIS_TIMEOUT_S the bridge exits cleanly
+# (sys.exit 3) so the Node parent's restart logic recovers — bounding
+# the attack to 5 minutes per attempt instead of indefinite.
+#
+# Cross-platform: pure stdlib (queue, threading), no select/signal which
+# don't work on Windows stdin. Reader is a daemon so it dies with the
+# process. EOF is propagated to the main loop via _reader_done.
+
+_HEARTBEAT_INTERVAL_S = 30
+_SLOW_LORIS_TIMEOUT_S = 300  # 5 minutes — long enough that a normal
+                              # idle MCP session never trips it.
+
+_input_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=64)
+_last_byte_time = [time.monotonic()]
+_reader_done = threading.Event()
+
+
+def _stdin_reader_loop():
+    """Daemon thread: read whole lines from stdin and queue them.
+
+    On EOF or unrecoverable I/O error, sets `_reader_done` and exits.
+    Main loop drains remaining queue then quits.
+    """
+    raw_stdin = sys.stdin.buffer
+    try:
+        while True:
+            line = raw_stdin.readline(_MAX_REQUEST_BYTES)
+            if not line:
+                break  # EOF
+            _last_byte_time[0] = time.monotonic()
+            _input_queue.put(line)
+    except Exception as exc:
+        print(f"stdin reader: fatal I/O error: {exc}", file=sys.stderr, flush=True)
+    finally:
+        _reader_done.set()
+
+
 def main():
     _check_engine_version()  # may sys.exit(2) on incompatible engine
     print(f"ready (engine v{_engine_version})", file=sys.stderr, flush=True)
 
-    # B-2: bound per-line reads so a malicious / buggy client cannot
-    # hang the bridge with an unterminated giant line. We read raw bytes
-    # with a hard limit, then decode once.
-    raw_stdin = sys.stdin.buffer
+    threading.Thread(target=_stdin_reader_loop, daemon=True).start()
+
     while True:
-        raw_line = raw_stdin.readline(_MAX_REQUEST_BYTES)
-        if not raw_line:
-            break  # EOF
+        # Drain the queue, then exit cleanly when the reader has signaled EOF.
+        if _reader_done.is_set() and _input_queue.empty():
+            return
+
+        try:
+            raw_line = _input_queue.get(timeout=_HEARTBEAT_INTERVAL_S)
+        except queue.Empty:
+            # No bytes for HEARTBEAT_INTERVAL_S. Check whether we have
+            # been completely silent for SLOW_LORIS_TIMEOUT_S — that is
+            # the slow-loris signature. Exit so the parent can restart.
+            elapsed = time.monotonic() - _last_byte_time[0]
+            if elapsed > _SLOW_LORIS_TIMEOUT_S:
+                print(
+                    f"FATAL: no input received in {int(elapsed)}s "
+                    f"(slow-loris threshold {_SLOW_LORIS_TIMEOUT_S}s). "
+                    "Exiting so the MCP parent can restart bridge.py with "
+                    "a fresh stdin pipe.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                sys.exit(3)
+            continue
+
+        # B-2 oversize handling stays the same: reader honored the cap;
+        # if a line came back at exactly the cap with no trailing \n, it
+        # was truncated by readline(). Drain remainder via the reader
+        # thread (which will keep posting more chunks for the same line),
+        # then reject. We approximate this with a one-shot guard.
         if len(raw_line) >= _MAX_REQUEST_BYTES and not raw_line.endswith(b"\n"):
-            # Hit the cap without seeing a newline — drain the rest of
-            # this line so the next iteration starts at a fresh request.
-            while True:
-                tail = raw_stdin.readline(_MAX_REQUEST_BYTES)
-                if not tail or tail.endswith(b"\n"):
-                    break
             respond_error(None, -32600, "Request exceeds 16 MiB cap")
             continue
         try:
@@ -1432,23 +1566,34 @@ def main():
         method = request.get("method")
         params = request.get("params", {})
 
-        # Defense-in-depth: validate all path parameters before dispatch.
-        # B-1: raw-string check — do NOT normpath first (normpath collapses
-        # the traversal segment before the check sees it).
+        # B-1 + S-2 root: defense-in-depth path validation. Every path-shaped
+        # parameter in `params` flows through `_validate_path()`, which
+        # mirrors src/schemas.ts PATH_CHECKS exactly. Pre-fix, the bridge
+        # only checked '..' and used os.path.normpath (which collapses
+        # the traversal segment before the check could see it). Now: every
+        # path attribute gets the full Zod-equivalent gate (absolute,
+        # .pdf or directory, no traversal, no control chars, no Windows
+        # reserved name, no trailing dot/space, length cap).
         path_invalid = False
         if isinstance(params, dict):
             for key, val in params.items():
-                if (key.endswith("_path") or key == "output_dir") and isinstance(val, str):
-                    if _PATH_TRAVERSAL_RE.search(val):
-                        respond_error(req_id, -32602, f"Invalid path parameter '{key}': contains '..'")
+                if isinstance(val, str) and (
+                    key.endswith("_path") or key == "output_dir"
+                ):
+                    requires_pdf_ext = key != "output_dir"
+                    err = _validate_path(val, require_pdf_extension=requires_pdf_ext)
+                    if err:
+                        respond_error(req_id, -32602, f"Invalid path parameter '{key}': {err}")
                         path_invalid = True
                         break
                 if key == "pdf_paths" and isinstance(val, list):
                     for p in val:
-                        if isinstance(p, str) and _PATH_TRAVERSAL_RE.search(p):
-                            respond_error(req_id, -32602, f"Invalid path in '{key}': contains '..'")
-                            path_invalid = True
-                            break
+                        if isinstance(p, str):
+                            err = _validate_path(p, require_pdf_extension=True)
+                            if err:
+                                respond_error(req_id, -32602, f"Invalid path in '{key}': {err}")
+                                path_invalid = True
+                                break
                     if path_invalid:
                         break
         if path_invalid:

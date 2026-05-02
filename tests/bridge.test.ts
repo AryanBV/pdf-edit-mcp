@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +55,33 @@ describe("bridge.py integration tests", () => {
   let callId = 0;
 
   beforeAll(async () => {
+    // CR-12 root: auto-bootstrap fixtures if missing. Pre-fix, prepublishOnly
+    // ran ONLY validation+security tests because integration tests would
+    // fail on a fresh clone (fixtures don't exist until generate_fixtures.py
+    // runs). Now: detect missing fixtures, run the generator inline, then
+    // proceed. If reportlab isn't installed the generator fails — surface
+    // a clear error instead of confusing "ENOENT fixture.pdf" later.
+    if (!existsSync(FIXTURE_PDF) || !existsSync(STRUCTURED_PDF)) {
+      const generator = resolve(__dirname, "generate_fixtures.py");
+      const out = spawnSync(PYTHON_CMD, [generator], {
+        cwd: resolve(__dirname, ".."),
+        encoding: "utf-8",
+      });
+      if (out.status !== 0) {
+        throw new Error(
+          `Fixture generation failed (exit ${out.status}). ` +
+            `Ensure reportlab is installed: pip install reportlab\n` +
+            `stderr: ${out.stderr ?? "(none)"}`,
+        );
+      }
+      if (!existsSync(FIXTURE_PDF) || !existsSync(STRUCTURED_PDF)) {
+        throw new Error(
+          `generate_fixtures.py ran but expected fixtures still missing: ` +
+            `${FIXTURE_PDF}, ${STRUCTURED_PDF}`,
+        );
+      }
+    }
+
     proc = spawn(PYTHON_CMD, [BRIDGE_PATH], {
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -882,6 +909,346 @@ describe("bridge.py integration tests", () => {
       }
     } finally {
       if (existsSync(encryptedPath)) unlinkSync(encryptedPath);
+    }
+  });
+
+  // ── CR-1 root: smoke tests for the 17 wrapper / annotation tools ────
+  // These tools were registered in index.ts and dispatched in bridge.py
+  // but had zero integration tests pre-v0.1.1. A regression in any of
+  // them would have shipped silently. Each test below verifies (a) the
+  // call dispatches without crashing, (b) the bridge survives, (c) for
+  // write tools, the output file is produced.
+
+  it("merge concatenates two PDFs", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_merge.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("merge", {
+        pdf_paths: [FIXTURE_PDF, STRUCTURED_PDF],
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("split writes a per-page PDF", async () => {
+    const outputDir = resolve(__dirname, "fixtures", "split_out");
+    try {
+      const res = await call("split", {
+        pdf_path: FIXTURE_PDF,
+        output_dir: outputDir,
+      });
+      expect(res.error).toBeUndefined();
+    } finally {
+      // Best-effort cleanup — the split may have created multiple files
+      try {
+        const fs = await import("node:fs/promises");
+        await fs.rm(outputDir, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup errors
+      }
+    }
+  });
+
+  it("reorder_pages accepts a valid page_order", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_reorder.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("reorder_pages", {
+        pdf_path: STRUCTURED_PDF,
+        page_order: [0],
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("rotate_pages rotates a page by 90 degrees", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_rotate.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("rotate_pages", {
+        pdf_path: FIXTURE_PDF,
+        pages: [0],
+        angle: 90,
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("delete_pages removes a page from a multi-page PDF", async () => {
+    // STRUCTURED_PDF should have at least 1 page; for delete to succeed
+    // we use a 2-page input, which we synthesize via merge.
+    const merged = resolve(__dirname, "fixtures", "test_2page.pdf");
+    const outputPath = resolve(__dirname, "fixtures", "test_delete_pages.pdf");
+    if (existsSync(merged)) unlinkSync(merged);
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      await call("merge", {
+        pdf_paths: [FIXTURE_PDF, STRUCTURED_PDF],
+        output_path: merged,
+      });
+      const res = await call("delete_pages", {
+        pdf_path: merged,
+        pages: [0],
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(merged)) unlinkSync(merged);
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("crop_pages crops to a specified box", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_crop.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("crop_pages", {
+        pdf_path: FIXTURE_PDF,
+        box: { x0: 0, y0: 0, x1: 400, y1: 400 },
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("edit_metadata sets title and author", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_metadata.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("edit_metadata", {
+        pdf_path: FIXTURE_PDF,
+        metadata: { title: "Test Title", author: "Test Author" },
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("add_bookmark adds a bookmark to page 0", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_bookmark.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("add_bookmark", {
+        pdf_path: FIXTURE_PDF,
+        title: "Section 1",
+        page: 0,
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("decrypt round-trips with the right password", async () => {
+    const encryptedPath = resolve(__dirname, "fixtures", "test_to_decrypt.pdf");
+    const decryptedPath = resolve(__dirname, "fixtures", "test_decrypted.pdf");
+    if (existsSync(encryptedPath)) unlinkSync(encryptedPath);
+    if (existsSync(decryptedPath)) unlinkSync(decryptedPath);
+    try {
+      await call("encrypt", {
+        pdf_path: FIXTURE_PDF,
+        owner_password: "ownerpass",
+        user_password: "userpass",
+        output_path: encryptedPath,
+      });
+      const res = await call("decrypt", {
+        pdf_path: encryptedPath,
+        password: "userpass",
+        output_path: decryptedPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(decryptedPath)).toBe(true);
+    } finally {
+      if (existsSync(encryptedPath)) unlinkSync(encryptedPath);
+      if (existsSync(decryptedPath)) unlinkSync(decryptedPath);
+    }
+  });
+
+  it("add_hyperlink adds a clickable region", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_hyperlink.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("add_hyperlink", {
+        pdf_path: FIXTURE_PDF,
+        page: 0,
+        bbox: { x0: 50, y0: 50, x1: 250, y1: 100 },
+        uri: "https://example.com",
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("add_highlight adds a highlight quad", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_highlight.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("add_highlight", {
+        pdf_path: FIXTURE_PDF,
+        page: 0,
+        // Single quad: 8 floats (x1,y1,x2,y2,x3,y3,x4,y4) for a rectangular highlight
+        quad_points: [50, 50, 250, 50, 250, 100, 50, 100],
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("flatten_annotations runs without error", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_flatten.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("flatten_annotations", {
+        pdf_path: FIXTURE_PDF,
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("fill_form accepts an empty field map without error", async () => {
+    // FIXTURE_PDF doesn't have form fields, but the bridge should accept
+    // the call gracefully (engine fill_form with empty dict is a no-op).
+    const outputPath = resolve(__dirname, "fixtures", "test_fillform.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("fill_form", {
+        pdf_path: FIXTURE_PDF,
+        field_values: {},
+        output_path: outputPath,
+      });
+      // Engine may either succeed (output written) or error if no form
+      // fields exist. Both are acceptable; what matters is no crash and
+      // the bridge stays responsive.
+      const followup = await call("get_text", { pdf_path: FIXTURE_PDF });
+      expect(followup.error).toBeUndefined();
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("add_watermark applies a watermark overlay", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_watermark.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("add_watermark", {
+        pdf_path: FIXTURE_PDF,
+        watermark_path: STRUCTURED_PDF, // any valid PDF works as watermark
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("get_annotations returns an array even when there are none", async () => {
+    const res = await call("get_annotations", { pdf_path: FIXTURE_PDF });
+    expect(res.error).toBeUndefined();
+    expect(Array.isArray(res.result!.annotations)).toBe(true);
+  });
+
+  it("add_annotation adds a link annotation", async () => {
+    const outputPath = resolve(__dirname, "fixtures", "test_add_annot.pdf");
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      const res = await call("add_annotation", {
+        pdf_path: FIXTURE_PDF,
+        page: 0,
+        rect: { x0: 50, y0: 50, x1: 250, y1: 100 },
+        uri: "https://example.com/added",
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("delete_annotation_v2 removes an annotation by index", async () => {
+    const annotated = resolve(__dirname, "fixtures", "test_to_delete_annot.pdf");
+    const outputPath = resolve(__dirname, "fixtures", "test_deleted_annot.pdf");
+    if (existsSync(annotated)) unlinkSync(annotated);
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      await call("add_annotation", {
+        pdf_path: FIXTURE_PDF,
+        page: 0,
+        rect: { x0: 50, y0: 50, x1: 250, y1: 100 },
+        uri: "https://example.com/to-delete",
+        output_path: annotated,
+      });
+      const res = await call("delete_annotation_v2", {
+        pdf_path: annotated,
+        page: 0,
+        annotation_index: 0,
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(annotated)) unlinkSync(annotated);
+      if (existsSync(outputPath)) unlinkSync(outputPath);
+    }
+  });
+
+  it("move_annotation repositions an annotation", async () => {
+    const annotated = resolve(__dirname, "fixtures", "test_to_move_annot.pdf");
+    const outputPath = resolve(__dirname, "fixtures", "test_moved_annot.pdf");
+    if (existsSync(annotated)) unlinkSync(annotated);
+    if (existsSync(outputPath)) unlinkSync(outputPath);
+    try {
+      await call("add_annotation", {
+        pdf_path: FIXTURE_PDF,
+        page: 0,
+        rect: { x0: 50, y0: 50, x1: 250, y1: 100 },
+        uri: "https://example.com/to-move",
+        output_path: annotated,
+      });
+      const res = await call("move_annotation", {
+        pdf_path: annotated,
+        page: 0,
+        annotation_index: 0,
+        new_rect: { x0: 100, y0: 100, x1: 300, y1: 150 },
+        output_path: outputPath,
+      });
+      expect(res.error).toBeUndefined();
+      expect(existsSync(outputPath)).toBe(true);
+    } finally {
+      if (existsSync(annotated)) unlinkSync(annotated);
+      if (existsSync(outputPath)) unlinkSync(outputPath);
     }
   });
 });

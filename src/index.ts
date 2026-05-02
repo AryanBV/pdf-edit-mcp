@@ -1018,22 +1018,38 @@ server.registerTool(
 
 // ── Wrapper tools (document operations) ─────────────────────────────
 
-// CR-3: helper for simple write tools that follow the same bridge-call
-// pattern. The original implementation used `as Function` (banned in strict
-// lint setups) because `server.registerTool`'s overloads don't infer well
-// through a wrapper. We narrow the cast to the third-argument callback type
-// only — every other argument stays statically typed.
-type RegisterToolFn = typeof server.registerTool;
-type RegisterToolCallback = Parameters<RegisterToolFn>[2];
+// CR-3 root fix: helper for simple write tools that follow the same
+// bridge-call pattern. The schema and paramsFn are generically bound to
+// the same TShape so `paramsFn`'s `args` is fully type-safe at the
+// callsite via `z.infer<z.ZodObject<TShape>>`.
+//
+// One narrow cast remains on the callback: `as RegisterToolCallback`.
+// This is genuinely unavoidable given the MCP SDK's type model:
+// `server.registerTool` is heavily overloaded across InputSchema being
+// a ZodObject, ZodRawShape, or undefined — and TypeScript's overload
+// resolution does NOT propagate generic type parameters into overload
+// selection. The SDK's `BaseToolCallback<TInput>` type uses TInput in
+// a contra-variant position which generic inference loses through a
+// wrapper function.
+//
+// Three alternatives considered and rejected:
+//  (a) `as Function` (the original v0.1.0): banned in strict lint.
+//  (b) Inlining 18 registerTool calls: ~180 LOC churn, no DRY win,
+//      and the runtime behavior is identical anyway.
+//  (c) Forking the SDK types: out of scope.
+// The single typed-cast on the callback is therefore the type-safety
+// floor we can reach from the public SDK surface. Verified against
+// every callsite — `paramsFn` IS typed correctly, runtime args match.
+type RegisterToolCallback = Parameters<typeof server.registerTool>[2];
 
-function registerWriteTool(
+function registerWriteTool<TShape extends z.ZodRawShape>(
   name: string,
   desc: string,
-  schema: z.ZodObject<z.ZodRawShape>,
+  schema: z.ZodObject<TShape>,
   bridgeMethod: string,
-  paramsFn: (args: Record<string, unknown>) => Record<string, unknown>
+  paramsFn: (args: z.infer<z.ZodObject<TShape>>) => Record<string, unknown>
 ): void {
-  const callback = (async (args: Record<string, unknown>) => {
+  const callback = (async (args: z.infer<z.ZodObject<TShape>>) => {
     try {
       const result = await bridge.call(bridgeMethod, paramsFn(args));
       return toolSuccess(result);
@@ -1054,7 +1070,7 @@ function registerWriteTool(
         openWorldHint: false,
       },
     },
-    callback
+    callback,
   );
 }
 

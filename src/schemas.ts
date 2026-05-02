@@ -1,69 +1,122 @@
 import { z } from "zod";
+import {
+  MAX_PATH_LENGTH,
+  MAX_SEARCH_TEXT,
+  MAX_REPLACEMENT_TEXT,
+  MAX_EDITS_PER_BATCH,
+  MAX_FONT_NAME,
+  MAX_URI,
+  MAX_TITLE,
+  MAX_SECTION_NAME,
+  MAX_METADATA_VALUE,
+  MAX_FORM_FIELD_VALUE,
+  MAX_INSERT_TEXT,
+  MAX_COORDINATE,
+  MIN_FONT_SIZE,
+  MAX_FONT_SIZE,
+  DEFAULT_FONT_SIZE,
+  MIN_LINE_HEIGHT,
+  MAX_LINE_HEIGHT,
+  MAX_REPLACEMENTS_PER_BATCH,
+  MAX_PDFS_PER_MERGE,
+  MAX_PAGE_INDICES,
+  MAX_HIGHLIGHT_VALUES,
+  MIN_HIGHLIGHT_VALUES,
+  MAX_METADATA_KEYS,
+  MAX_FORM_FIELDS,
+  MAX_PASSWORD,
+} from "./constants.js";
 
-// S-2: Windows reserved device names. On Windows, opening C:/output/NUL.pdf
-// silently writes to the null device; CON.pdf writes to the console (which
-// would corrupt this MCP server's stdout JSON-RPC stream). Reject any path
-// whose final basename starts with one of these names (with or without
-// .pdf extension) before it can reach pikepdf.
+// Re-export for downstream consumers (tests, external imports).
+export { MAX_REPLACEMENT_TEXT } from "./constants.js";
+
+// ── Path safety (B-1 + S-2 root fix) ─────────────────────────────────
+//
+// Single source of truth for "what is a safe path?" for this MCP. Every
+// path-shaped field in every schema reuses pdfPathSchema or
+// outputPathSchema, which apply the FULL list of checks below. Adding a
+// new check here covers every consumer for free; pre-fix, each schema
+// re-rolled its own .refine() chain and they drifted (the audit found
+// 50K vs 100K text caps drifting the same way).
+//
+// Bridge.py mirrors this list verbatim in `_validate_path()` (B-1) so
+// the bridge stays defended even when invoked directly (test harness,
+// alternate clients) without going through Zod.
+
+const ABSOLUTE_PATH_RE = /^[A-Za-z]:[/\\]|^\//;
+const TRAVERSAL_RE = /(^|[\\/])\.\.([\\/]|$)/;
+const CONTROL_CHARS_RE = /[\x00-\x1f]/;
+const TRAILING_DOT_OR_SPACE_RE = /[. ]$/;
+// Windows reserved device names — opening these silently writes to the
+// null device / console / printer port instead of a file.
 const WINDOWS_RESERVED_RE = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i;
-const isReservedName = (p: string): boolean => {
-  const basename = p.split(/[/\\]/).pop() ?? "";
-  return WINDOWS_RESERVED_RE.test(basename);
-};
 
-/** Absolute path to a PDF file (Windows or Unix). */
-export const pdfPathSchema = z
-  .string()
-  .min(1, "Path must not be empty")
-  .max(4096, "Path exceeds maximum length")
-  .refine((p) => /^[A-Za-z]:[/\\]|^\//.test(p), {
-    message: "Path must be absolute",
-  })
-  .refine((p) => p.toLowerCase().endsWith(".pdf"), {
-    message: "Path must end with .pdf",
-  })
-  .refine((p) => !/(^|[\\/])\.\.([\\/]|$)/.test(p), {
-    message: "Path must not contain directory traversal (..)",
-  })
-  .refine((p) => !isReservedName(p), {
-    message: "Path must not use a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)",
-  })
-  .describe("Absolute path to the PDF file");
+interface PathCheck {
+  test: (p: string) => boolean;
+  message: string;
+}
 
-/** Absolute path for PDF output (Windows or Unix). */
-export const outputPathSchema = z
-  .string()
-  .min(1, "Path must not be empty")
-  .max(4096, "Path exceeds maximum length")
-  .refine((p) => /^[A-Za-z]:[/\\]|^\//.test(p), {
-    message: "Path must be absolute",
-  })
-  .refine((p) => p.toLowerCase().endsWith(".pdf"), {
-    message: "Path must end with .pdf",
-  })
-  .refine((p) => !/(^|[\\/])\.\.([\\/]|$)/.test(p), {
-    message: "Path must not contain directory traversal (..)",
-  })
-  .refine((p) => !isReservedName(p), {
+const PATH_CHECKS: readonly PathCheck[] = [
+  { test: (p) => p.length >= 1, message: "Path must not be empty" },
+  { test: (p) => p.length <= MAX_PATH_LENGTH, message: `Path exceeds maximum length (${MAX_PATH_LENGTH})` },
+  { test: (p) => ABSOLUTE_PATH_RE.test(p), message: "Path must be absolute" },
+  { test: (p) => p.toLowerCase().endsWith(".pdf"), message: "Path must end with .pdf" },
+  { test: (p) => !TRAVERSAL_RE.test(p), message: "Path must not contain directory traversal (..)" },
+  { test: (p) => !CONTROL_CHARS_RE.test(p), message: "Path must not contain control characters (NUL, etc.)" },
+  {
+    test: (p) => {
+      const basename = p.split(/[/\\]/).pop() ?? "";
+      return !TRAILING_DOT_OR_SPACE_RE.test(basename);
+    },
+    message: "Path basename must not end with '.' or ' ' (Windows treats these as truncated)",
+  },
+  {
+    test: (p) => {
+      const basename = p.split(/[/\\]/).pop() ?? "";
+      return !WINDOWS_RESERVED_RE.test(basename);
+    },
     message: "Path must not use a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)",
-  })
-  .describe("Absolute path for the output PDF file");
+  },
+];
+
+/** Universal path-safety predicate. Returns the first failing check's
+ *  message, or null when the path is safe. Exported so bridge-side and
+ *  test-side code can reuse the same definition. */
+export function pathSafetyError(p: string): string | null {
+  for (const { test, message } of PATH_CHECKS) {
+    if (!test(p)) return message;
+  }
+  return null;
+}
+
+/** Build a Zod string schema applying every PATH_CHECKS entry. */
+function buildPathSchema(description: string) {
+  let schema = z.string();
+  for (const { test, message } of PATH_CHECKS) {
+    schema = schema.refine(test, { message }) as unknown as z.ZodString;
+  }
+  return schema.describe(description);
+}
+
+/** Absolute path to a PDF file (Windows or Unix). Applies the full
+ *  PATH_CHECKS list. */
+export const pdfPathSchema = buildPathSchema("Absolute path to the PDF file");
+
+/** Absolute path for PDF output (Windows or Unix). Applies the full
+ *  PATH_CHECKS list. */
+export const outputPathSchema = buildPathSchema("Absolute path for the output PDF file");
 
 /** Non-empty search text. */
 export const searchSchema = z
   .string()
   .min(1, "Search text must not be empty")
-  .max(10_000, "Search text exceeds maximum length (10,000 chars)")
+  .max(MAX_SEARCH_TEXT, `Search text exceeds maximum length (${MAX_SEARCH_TEXT} chars)`)
   .describe("Text to search for in the PDF");
-
-/** Max replacement / new-text length in characters — standardized across
- *  every text-replacement field for predictable LLM caller behavior. */
-export const MAX_REPLACEMENT_TEXT = 100_000;
 
 /** A single find/replace edit pair. */
 export const editSchema = z
   .object({
-    find: z.string().min(1, "Find text must not be empty").max(10_000),
+    find: z.string().min(1, "Find text must not be empty").max(MAX_SEARCH_TEXT),
     replace: z.string().max(MAX_REPLACEMENT_TEXT),
   })
   .strict();
@@ -72,7 +125,7 @@ export const editSchema = z
 export const editsArraySchema = z
   .array(editSchema)
   .min(1, "At least one edit is required")
-  .max(500, "Maximum 500 edits per batch");
+  .max(MAX_EDITS_PER_BATCH, `Maximum ${MAX_EDITS_PER_BATCH} edits per batch`);
 
 // ── Tool input schemas ───────────────────────────────────────────────
 
@@ -176,11 +229,11 @@ export const analyzeSubsetInputSchema = z
     text: z
       .string()
       .min(1, "Text must not be empty")
-      .max(10_000)
+      .max(MAX_SEARCH_TEXT)
       .describe("Text to check for glyph availability"),
     font_name: z
       .string()
-      .max(200)
+      .max(MAX_FONT_NAME)
       .optional()
       .describe(
         "Font name as it appears in the PDF (e.g. 'F1'). If omitted, uses the first font found."
@@ -247,7 +300,7 @@ export const updateAnnotationInputSchema = z
     url: z
       .string()
       .min(1, "URL must not be empty")
-      .max(2048)
+      .max(MAX_URI)
       .describe("New URL for the link annotation"),
     output_path: outputPathSchema,
   })
@@ -257,10 +310,10 @@ export const updateAnnotationInputSchema = z
 
 export const bboxSchema = z
   .object({
-    x0: z.number().min(-10_000).max(10_000).describe("Left edge x-coordinate"),
-    y0: z.number().min(-10_000).max(10_000).describe("Bottom edge y-coordinate"),
-    x1: z.number().min(-10_000).max(10_000).describe("Right edge x-coordinate"),
-    y1: z.number().min(-10_000).max(10_000).describe("Top edge y-coordinate"),
+    x0: z.number().min(-MAX_COORDINATE).max(MAX_COORDINATE).describe("Left edge x-coordinate"),
+    y0: z.number().min(-MAX_COORDINATE).max(MAX_COORDINATE).describe("Bottom edge y-coordinate"),
+    x1: z.number().min(-MAX_COORDINATE).max(MAX_COORDINATE).describe("Right edge x-coordinate"),
+    y1: z.number().min(-MAX_COORDINATE).max(MAX_COORDINATE).describe("Top edge y-coordinate"),
   })
   .strict();
 
@@ -276,24 +329,24 @@ export const replaceBlockInputSchema = z
     new_text: z
       .string()
       .min(1, "Replacement text must not be empty")
-      .max(100_000)
+      .max(MAX_REPLACEMENT_TEXT)
       .describe("New text content for the block"),
     output_path: outputPathSchema,
     font_name: z
       .string()
-      .max(200)
+      .max(MAX_FONT_NAME)
       .optional()
       .describe("Font name override (uses detected font if omitted)"),
     font_size: z
       .number()
-      .min(0.5)
-      .max(1000)
+      .min(MIN_FONT_SIZE)
+      .max(MAX_FONT_SIZE)
       .optional()
       .describe("Font size override (uses detected size if omitted)"),
     line_height: z
       .number()
-      .min(0.5)
-      .max(1000)
+      .min(MIN_LINE_HEIGHT)
+      .max(MAX_LINE_HEIGHT)
       .optional()
       .describe(
         "Explicit line-height for the rewritten block in PDF points (engine v0.1.2+). " +
@@ -311,30 +364,30 @@ export const insertTextBlockInputSchema = z
       .int()
       .min(0)
       .describe("0-indexed page number"),
-    x: z.number().min(-10_000).max(10_000).describe("X-coordinate for text insertion"),
-    y: z.number().min(-10_000).max(10_000).describe("Y-coordinate for text insertion"),
+    x: z.number().min(-MAX_COORDINATE).max(MAX_COORDINATE).describe("X-coordinate for text insertion"),
+    y: z.number().min(-MAX_COORDINATE).max(MAX_COORDINATE).describe("Y-coordinate for text insertion"),
     text: z
       .string()
       .min(1, "Text must not be empty")
-      .max(100_000)
+      .max(MAX_INSERT_TEXT)
       .describe("Text content to insert"),
     output_path: outputPathSchema,
     font_name: z
       .string()
-      .max(200)
+      .max(MAX_FONT_NAME)
       .optional()
       .describe("Font name (uses default if omitted)"),
     font_size: z
       .number()
-      .min(0.5)
-      .max(1000)
+      .min(MIN_FONT_SIZE)
+      .max(MAX_FONT_SIZE)
       .optional()
-      .default(12.0)
+      .default(DEFAULT_FONT_SIZE)
       .describe("Font size in points (default: 12)"),
     max_width: z
       .number()
       .min(1)
-      .max(10_000)
+      .max(MAX_COORDINATE)
       .optional()
       .describe("Maximum width for text wrapping (no wrapping if omitted)"),
   })
@@ -347,7 +400,7 @@ export const blockReplacementSchema = z
     new_text: z
       .string()
       .min(1, "Replacement text must not be empty")
-      .max(100_000)
+      .max(MAX_REPLACEMENT_TEXT)
       .describe("New text content for the block"),
   })
   .strict();
@@ -376,13 +429,13 @@ export const batchReplaceBlockInputSchema = z
     replacements: z
       .array(blockReplacementSchema)
       .min(1, "At least one replacement is required")
-      .max(50, "Maximum 50 replacements per batch")
+      .max(MAX_REPLACEMENTS_PER_BATCH, `Maximum ${MAX_REPLACEMENTS_PER_BATCH} replacements per batch`)
       .describe("Array of {bbox, new_text} replacements to apply"),
     output_path: outputPathSchema,
     line_height: z
       .number()
-      .min(0.5)
-      .max(1000)
+      .min(MIN_LINE_HEIGHT)
+      .max(MAX_LINE_HEIGHT)
       .optional()
       .describe(
         "Explicit line-height for every rewritten block in PDF points (engine v0.1.2+). " +
@@ -391,7 +444,7 @@ export const batchReplaceBlockInputSchema = z
     section_gap: z
       .number()
       .min(0)
-      .max(1000)
+      .max(MAX_LINE_HEIGHT)
       .optional()
       .describe(
         "Vertical gap (in PDF points) between consecutive replaced sections " +
@@ -463,14 +516,14 @@ export const swapSectionsInputSchema = z
     section_a: z
       .string()
       .min(1)
-      .max(500)
+      .max(MAX_SECTION_NAME)
       .describe(
         "Name or partial name of the first section to swap (fuzzy matched against detected section titles)"
       ),
     section_b: z
       .string()
       .min(1)
-      .max(500)
+      .max(MAX_SECTION_NAME)
       .describe(
         "Name or partial name of the second section to swap (fuzzy matched)"
       ),
@@ -491,14 +544,14 @@ export const replaceSectionInputSchema = z
     section: z
       .string()
       .min(1)
-      .max(500)
+      .max(MAX_SECTION_NAME)
       .describe(
         "Name or partial name of the section to replace (fuzzy matched against detected section titles)"
       ),
     new_text: z
       .string()
       .min(1)
-      .max(100_000)
+      .max(MAX_REPLACEMENT_TEXT)
       .describe("New text content for the section (replaces title, tech stack, bullets — everything)"),
     output_path: outputPathSchema,
     page: z
@@ -533,16 +586,30 @@ export const detectSectionsInputSchema = z
 
 // ── Wrapper operation schemas ───────────────────────────────────────
 
-/** Absolute directory path. */
+/** Absolute directory path. Reuses a subset of PATH_CHECKS — no .pdf
+ *  suffix requirement, but every other safety check applies. */
 const dirPathSchema = z
   .string()
   .min(1, "Path must not be empty")
-  .max(4096, "Path exceeds maximum length")
-  .refine((p) => /^[A-Za-z]:[/\\]|^\//.test(p), {
-    message: "Path must be absolute",
-  })
-  .refine((p) => !/(^|[\\/])\.\.([\\/]|$)/.test(p), {
+  .max(MAX_PATH_LENGTH, `Path exceeds maximum length (${MAX_PATH_LENGTH})`)
+  .refine((p) => ABSOLUTE_PATH_RE.test(p), { message: "Path must be absolute" })
+  .refine((p) => !TRAVERSAL_RE.test(p), {
     message: "Path must not contain directory traversal (..)",
+  })
+  .refine((p) => !CONTROL_CHARS_RE.test(p), {
+    message: "Path must not contain control characters (NUL, etc.)",
+  })
+  .refine((p) => {
+    const basename = p.split(/[/\\]/).pop() ?? "";
+    return !TRAILING_DOT_OR_SPACE_RE.test(basename);
+  }, {
+    message: "Path basename must not end with '.' or ' ' (Windows treats these as truncated)",
+  })
+  .refine((p) => {
+    const basename = p.split(/[/\\]/).pop() ?? "";
+    return !WINDOWS_RESERVED_RE.test(basename);
+  }, {
+    message: "Path must not use a Windows reserved device name",
   })
   .describe("Absolute directory path");
 
@@ -551,7 +618,7 @@ export const mergeInputSchema = z
     pdf_paths: z
       .array(pdfPathSchema)
       .min(2, "At least 2 PDFs required to merge")
-      .max(100, "Maximum 100 PDFs per merge"),
+      .max(MAX_PDFS_PER_MERGE, `Maximum ${MAX_PDFS_PER_MERGE} PDFs per merge`),
     output_path: outputPathSchema,
   })
   .strict();
@@ -569,7 +636,7 @@ export const reorderPagesInputSchema = z
     page_order: z
       .array(z.number().int().min(0))
       .min(1, "At least one page index required")
-      .max(10_000)
+      .max(MAX_PAGE_INDICES)
       .describe("New page order as 0-indexed page numbers"),
     output_path: outputPathSchema,
   })
@@ -581,7 +648,7 @@ export const rotatePagesInputSchema = z
     pages: z
       .array(z.number().int().min(0))
       .min(1, "At least one page index required")
-      .max(10_000)
+      .max(MAX_PAGE_INDICES)
       .describe("0-indexed page numbers to rotate"),
     angle: z
       .number()
@@ -600,7 +667,7 @@ export const deletePagesInputSchema = z
     pages: z
       .array(z.number().int().min(0))
       .min(1, "At least one page index required")
-      .max(10_000)
+      .max(MAX_PAGE_INDICES)
       .describe("0-indexed page numbers to delete"),
     output_path: outputPathSchema,
   })
@@ -618,9 +685,9 @@ export const editMetadataInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
     metadata: z
-      .record(z.string().max(1000))
-      .refine((obj) => Object.keys(obj).length <= 50, {
-        message: "metadata may have at most 50 keys",
+      .record(z.string().max(MAX_METADATA_VALUE))
+      .refine((obj) => Object.keys(obj).length <= MAX_METADATA_KEYS, {
+        message: `metadata may have at most ${MAX_METADATA_KEYS} keys`,
       })
       .describe("Metadata fields to set (e.g. {title, author, subject, creator})"),
     output_path: outputPathSchema,
@@ -630,7 +697,7 @@ export const editMetadataInputSchema = z
 export const addBookmarkInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
-    title: z.string().min(1).max(500).describe("Bookmark title"),
+    title: z.string().min(1).max(MAX_TITLE).describe("Bookmark title"),
     page: z.number().int().min(0).describe("0-indexed target page"),
     output_path: outputPathSchema,
   })
@@ -639,8 +706,8 @@ export const addBookmarkInputSchema = z
 export const encryptInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
-    owner_password: z.string().min(1).max(128).describe("Owner password"),
-    user_password: z.string().max(128).describe("User password (can be empty for no user password)"),
+    owner_password: z.string().min(1).max(MAX_PASSWORD).describe("Owner password"),
+    user_password: z.string().max(MAX_PASSWORD).describe("User password (can be empty for no user password)"),
     output_path: outputPathSchema,
   })
   .strict();
@@ -648,7 +715,7 @@ export const encryptInputSchema = z
 export const decryptInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
-    password: z.string().min(1).max(128).describe("Password to decrypt the PDF"),
+    password: z.string().min(1).max(MAX_PASSWORD).describe("Password to decrypt the PDF"),
     output_path: outputPathSchema,
   })
   .strict();
@@ -658,7 +725,7 @@ export const addHyperlinkInputSchema = z
     pdf_path: pdfPathSchema,
     page: z.number().int().min(0).describe("0-indexed page number"),
     bbox: bboxSchema.describe("Link region bounding box"),
-    uri: z.string().min(1).max(2048).describe("Target URL"),
+    uri: z.string().min(1).max(MAX_URI).describe("Target URL"),
     output_path: outputPathSchema,
   })
   .strict();
@@ -669,8 +736,8 @@ export const addHighlightInputSchema = z
     page: z.number().int().min(0).describe("0-indexed page number"),
     quad_points: z
       .array(z.number())
-      .min(8, "At least 8 values (one quad) required")
-      .max(800, "Maximum 100 quads (800 values)")
+      .min(MIN_HIGHLIGHT_VALUES, `At least ${MIN_HIGHLIGHT_VALUES} values (one quad) required`)
+      .max(MAX_HIGHLIGHT_VALUES, `Maximum ${MAX_HIGHLIGHT_VALUES / 8} quads (${MAX_HIGHLIGHT_VALUES} values)`)
       .refine((arr) => arr.length % 8 === 0, {
         message: "QuadPoints must contain complete quads (8 floats per quad)",
       })
@@ -690,9 +757,9 @@ export const fillFormInputSchema = z
   .object({
     pdf_path: pdfPathSchema,
     field_values: z
-      .record(z.string().max(10_000))
-      .refine((obj) => Object.keys(obj).length <= 500, {
-        message: "field_values may have at most 500 fields",
+      .record(z.string().max(MAX_FORM_FIELD_VALUE))
+      .refine((obj) => Object.keys(obj).length <= MAX_FORM_FIELDS, {
+        message: `field_values may have at most ${MAX_FORM_FIELDS} fields`,
       })
       .describe("Map of form field names to values"),
     output_path: outputPathSchema,
@@ -726,7 +793,7 @@ export const addAnnotationInputSchema = z
     pdf_path: pdfPathSchema,
     page: z.number().int().min(0).describe("0-indexed page number"),
     rect: bboxSchema.describe("Annotation position (x0, y0, x1, y1)"),
-    uri: z.string().min(1).max(2048).describe("Link target URL"),
+    uri: z.string().min(1).max(MAX_URI).describe("Link target URL"),
     output_path: outputPathSchema,
     border_style: z
       .string()
