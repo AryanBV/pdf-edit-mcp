@@ -28,6 +28,12 @@ pdf-edit-engine (Python library)
 
 6. **Engine version pin** — `bridge.py` hard-fails (`sys.exit(2)`) at startup if the installed `pdf-edit-engine` is older than `0.1.2`. The MCP relies on `FidelityReport.font_substituted` and `glyphs_missing` fields that older engines do not populate.
 
+7. **Naming conventions** (anchor these to prevent the kind of drift the v0.1.1 audit caught):
+   - **Page parameters are always named `page`** — 0-indexed integer. Never `page_number`, `page_idx`, `pg`, `page_num`. (`pdf_batch_replace_block` keeps `page_number` as a deprecated alias for v0.1.0 callers; will be dropped in v0.2.0.)
+   - **Replacement-text length cap is `MAX_REPLACEMENT_TEXT = 100_000`** in `src/schemas.ts`. New text-replacement fields must use that constant, not an inline `.max(50_000)` or other magic number.
+   - **Path schemas** (`pdfPathSchema`, `outputPathSchema`) are the only sources of truth for path validation. New tools accepting paths reuse these — never re-roll path-shape `.refine()` chains.
+   - **Engine error codes** (`-32001`..`-32004`) are reserved by `_ERROR_REGISTRY` in `bridge.py` for `OperatorError`, `EncodingError`, `ReflowError`, `FontNotFoundError` respectively. New engine error classes get their own code + recovery hint in the registry, not an ad-hoc except clause.
+
 ## Tech debt — section detection lives in bridge.py
 
 `bridge.py:handle_detect_sections` (~150 LOC) implements an MCP-side font-frequency heuristic to build a section tree from `get_text_layout`. This logic could plausibly belong in `pdf_edit_engine.structural` instead — pushing it down would let non-MCP callers reuse it, and the MCP would shrink to a thin wrapper. Tracked for v0.2.x. Do not extend this MCP-side detector with significant new logic; if changes are needed, push the work into the engine first.

@@ -118,6 +118,32 @@ def _translate_pikepdf(pdf_path):
         raise PDFEditError(f"Failed to open PDF {pdf_path}: {e}") from e
 
 
+# ── Error → JSON-RPC code + recovery hint registry ───────────────────
+#
+# CR-11 follow-up (post-audit re-review): instead of special-casing
+# OperatorError alone, every engine error subclass carries a structured
+# (code, hint) pair so AI agents can branch on the JSON-RPC error code
+# and surface the hint to the next call. -32001..-32004 are reserved
+# for engine-domain errors below; -32000 stays the generic PDFEditError
+# fallback.
+_ERROR_REGISTRY = {
+    OperatorError: (-32001, "TextMatch is stale — re-run pdf_find_text and retry with the fresh matches."),
+    EncodingError: (-32002, "Some characters cannot be encoded in the target font. Use pdf_analyze_subset to see which glyphs are missing."),
+    ReflowError: (-32003, "Reflow failed. The replacement may be too wide for the available space — try shorter text or a different bbox."),
+    FontNotFoundError: (-32004, "Font not present in the PDF or on the system. Use pdf_get_fonts to see embedded fonts; install the font system-wide if needed."),
+}
+
+
+def _classify_error(exc):
+    """Return (code, message) for an engine error, with a recovery hint
+    appended when the exception type is in the registry."""
+    for cls, (code, hint) in _ERROR_REGISTRY.items():
+        if isinstance(exc, cls):
+            return code, f"{type(exc).__name__}: {exc} (hint: {hint})"
+    # Generic PDFEditError fallback — no hint available.
+    return -32000, f"{type(exc).__name__}: {exc}"
+
+
 # ── Response helpers ──────────────────────────────────────────────────
 
 def respond_success(req_id, result):
@@ -904,115 +930,124 @@ def handle_swap_sections(params):
         except OSError:
             pass
 
-    result = handle_batch_replace_block({
-        "pdf_path": pdf_path, "page": page,
-        "replacements": replacements, "output_path": temp_path,
-    })
-
-    # Restore all annotations: swap pair at swapped positions, siblings at original
-    total_annots = sum(len(v) for v in saved_annots.values())
-    if total_annots > 0:
-        y_offset = match_a["bbox"]["y1"] - match_b["bbox"]["y1"]
-
-        with _translate_pikepdf(temp_path), pikepdf.open(temp_path, allow_overwriting_input=True) as pdf:
-            page_obj = pdf.pages[page]
-            annots_key = pikepdf.Name("/Annots")
-            rect_key = pikepdf.Name("/Rect")
-
-            # Remove all annotations in ALL sibling bboxes (clean slate)
-            if annots_key in page_obj:
-                kept = []
-                for annot_ref in list(page_obj[annots_key]):
-                    remove = False
-                    try:
-                        annot = annot_ref
-                        if hasattr(annot, "resolve"):
-                            annot = annot.resolve()
-                        if isinstance(annot, pikepdf.Dictionary) and rect_key in annot:
-                            r = annot[rect_key]
-                            cy = (float(r[1]) + float(r[3])) / 2
-                            cx = (float(r[0]) + float(r[2])) / 2
-                            for sib in siblings:
-                                b = sib["bbox"]
-                                if b["y0"] < cy < b["y1"] and b["x0"] < cx < b["x1"]:
-                                    remove = True
-                                    break
-                    except Exception:
-                        pass
-                    if not remove:
-                        kept.append(annot_ref)
-                page_obj[annots_key] = pikepdf.Array(kept) if kept else pikepdf.Array()
-
-            # Re-add all saved annotations at correct positions
-            if annots_key not in page_obj:
-                page_obj[annots_key] = pikepdf.Array()
-
-            def _make_link(rect_tuple, uri):
-                action = pikepdf.Dictionary({
-                    "/S": pikepdf.Name("/URI"),
-                    "/URI": pikepdf.String(uri),
-                })
-                return pdf.make_indirect(pikepdf.Dictionary({
-                    "/Type": pikepdf.Name("/Annot"),
-                    "/Subtype": pikepdf.Name("/Link"),
-                    "/Rect": pikepdf.Array([float(v) for v in rect_tuple]),
-                    "/Border": pikepdf.Array([0, 0, 0]),
-                    "/A": action,
-                }))
-
-            # Detect sections on the OUTPUT to find where each sibling actually landed
-            sib_shifts = {}  # title → y_shift
-            try:
-                out_det = handle_detect_sections({
-                    "pdf_path": temp_path, "page": page, "include_text": False,
-                })
-                out_all = []
-                for s in out_det["sections"]:
-                    out_all.append(s)
-                    for c in s.get("children", []):
-                        out_all.append(c)
-                for sib in siblings:
-                    # Find where this section's CONTENT landed in the output
-                    # Each section's annotations follow its own text
-                    # Match on first word (robust against spacing changes after re-render)
-                    first_word = sib["title"].split()[0].lower() if sib["title"].split() else ""
-                    out_sib = next(
-                        (s for s in out_all
-                         if s["level"] == sib["level"]
-                         and first_word
-                         and s["title"].lower().startswith(first_word)),
-                        None,
-                    )
-                    if out_sib:
-                        sib_shifts[sib["title"]] = out_sib["bbox"]["y1"] - sib["bbox"]["y1"]
-                    else:
-                        sib_shifts[sib["title"]] = 0.0
-            except Exception:
-                for sib in siblings:
-                    sib_shifts[sib["title"]] = 0.0
-
-            for sib in siblings:
-                annots_for_sib = saved_annots.get(sib["title"], [])
-                dy = sib_shifts.get(sib["title"], 0.0)
-                for a in annots_for_sib:
-                    new_rect = (a["rect"][0], a["rect"][1] + dy,
-                                a["rect"][2], a["rect"][3] + dy)
-                    page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
-
-            pdf.save(temp_path)
-
-    # X-1: atomic finalization. Only NOW does the user-supplied output_path
-    # get written. If anything above raised, the temp file is orphaned but
-    # output_path is untouched. os.replace is atomic on Windows + POSIX.
+    # X-1 follow-up (post-audit re-review): wrap everything in try/finally
+    # so the temp file does not leak when Phase 2 raises. `finalized` flips
+    # to True only after the atomic os.replace succeeds, after which the
+    # finally block has nothing to clean up. Pre-fix: a Phase-2 raise would
+    # leave `<output>.swap_tmp` orphaned on disk forever.
+    finalized = False
     try:
-        os.replace(temp_path, output_path)
-    except OSError as e:
-        # Best-effort cleanup of the temp before bubbling up.
+        result = handle_batch_replace_block({
+            "pdf_path": pdf_path, "page": page,
+            "replacements": replacements, "output_path": temp_path,
+        })
+
+        # Restore all annotations: swap pair at swapped positions, siblings at original
+        total_annots = sum(len(v) for v in saved_annots.values())
+        if total_annots > 0:
+            y_offset = match_a["bbox"]["y1"] - match_b["bbox"]["y1"]
+
+            with _translate_pikepdf(temp_path), pikepdf.open(temp_path, allow_overwriting_input=True) as pdf:
+                page_obj = pdf.pages[page]
+                annots_key = pikepdf.Name("/Annots")
+                rect_key = pikepdf.Name("/Rect")
+
+                # Remove all annotations in ALL sibling bboxes (clean slate)
+                if annots_key in page_obj:
+                    kept = []
+                    for annot_ref in list(page_obj[annots_key]):
+                        remove = False
+                        try:
+                            annot = annot_ref
+                            if hasattr(annot, "resolve"):
+                                annot = annot.resolve()
+                            if isinstance(annot, pikepdf.Dictionary) and rect_key in annot:
+                                r = annot[rect_key]
+                                cy = (float(r[1]) + float(r[3])) / 2
+                                cx = (float(r[0]) + float(r[2])) / 2
+                                for sib in siblings:
+                                    b = sib["bbox"]
+                                    if b["y0"] < cy < b["y1"] and b["x0"] < cx < b["x1"]:
+                                        remove = True
+                                        break
+                        except Exception:
+                            pass
+                        if not remove:
+                            kept.append(annot_ref)
+                    page_obj[annots_key] = pikepdf.Array(kept) if kept else pikepdf.Array()
+
+                # Re-add all saved annotations at correct positions
+                if annots_key not in page_obj:
+                    page_obj[annots_key] = pikepdf.Array()
+
+                def _make_link(rect_tuple, uri):
+                    action = pikepdf.Dictionary({
+                        "/S": pikepdf.Name("/URI"),
+                        "/URI": pikepdf.String(uri),
+                    })
+                    return pdf.make_indirect(pikepdf.Dictionary({
+                        "/Type": pikepdf.Name("/Annot"),
+                        "/Subtype": pikepdf.Name("/Link"),
+                        "/Rect": pikepdf.Array([float(v) for v in rect_tuple]),
+                        "/Border": pikepdf.Array([0, 0, 0]),
+                        "/A": action,
+                    }))
+
+                # Detect sections on the OUTPUT to find where each sibling actually landed
+                sib_shifts = {}  # title → y_shift
+                try:
+                    out_det = handle_detect_sections({
+                        "pdf_path": temp_path, "page": page, "include_text": False,
+                    })
+                    out_all = []
+                    for s in out_det["sections"]:
+                        out_all.append(s)
+                        for c in s.get("children", []):
+                            out_all.append(c)
+                    for sib in siblings:
+                        # Find where this section's CONTENT landed in the output
+                        # Each section's annotations follow its own text
+                        # Match on first word (robust against spacing changes after re-render)
+                        first_word = sib["title"].split()[0].lower() if sib["title"].split() else ""
+                        out_sib = next(
+                            (s for s in out_all
+                             if s["level"] == sib["level"]
+                             and first_word
+                             and s["title"].lower().startswith(first_word)),
+                            None,
+                        )
+                        if out_sib:
+                            sib_shifts[sib["title"]] = out_sib["bbox"]["y1"] - sib["bbox"]["y1"]
+                        else:
+                            sib_shifts[sib["title"]] = 0.0
+                except Exception:
+                    for sib in siblings:
+                        sib_shifts[sib["title"]] = 0.0
+
+                for sib in siblings:
+                    annots_for_sib = saved_annots.get(sib["title"], [])
+                    dy = sib_shifts.get(sib["title"], 0.0)
+                    for a in annots_for_sib:
+                        new_rect = (a["rect"][0], a["rect"][1] + dy,
+                                    a["rect"][2], a["rect"][3] + dy)
+                        page_obj[annots_key].append(_make_link(new_rect, a["uri"]))
+
+                pdf.save(temp_path)
+
+        # X-1: atomic finalization. os.replace is atomic on Windows + POSIX.
         try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise PDFEditError(f"Failed to finalize swap output: {e}") from e
+            os.replace(temp_path, output_path)
+            finalized = True
+        except OSError as e:
+            raise PDFEditError(f"Failed to finalize swap output: {e}") from e
+    finally:
+        # Always clean up the temp file unless os.replace finalized it
+        # (in which case the temp path no longer points anywhere).
+        if not finalized and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
     return {
         "success": all(r["success"] for r in result["results"]),
@@ -1426,18 +1461,14 @@ def main():
         try:
             result = METHODS[method](params)
             respond_success(req_id, result)
-        except OperatorError as e:
-            # CR-11: stale TextMatch — engine's INV-B-3 guard fired. Give
-            # callers a distinct error code (-32001) and a structured
-            # recovery hint so LLM agents can self-correct by re-running
-            # pdf_find_text without parsing the message string.
-            respond_error(
-                req_id,
-                -32001,
-                f"OperatorError: {e} (hint: re-run pdf_find_text, your match references are stale)",
-            )
-        except (PDFEditError, FontNotFoundError, EncodingError, ReflowError) as e:
-            respond_error(req_id, -32000, f"{type(e).__name__}: {e}")
+        except (PDFEditError, FontNotFoundError, EncodingError, ReflowError, OperatorError) as e:
+            # CR-11 follow-up: every engine error class flows through the
+            # registry so each gets a distinct JSON-RPC code and a recovery
+            # hint. OperatorError, EncodingError, ReflowError, and
+            # FontNotFoundError each have specific hints; bare PDFEditError
+            # falls through to -32000 with no hint.
+            code, msg = _classify_error(e)
+            respond_error(req_id, code, msg)
         except FileNotFoundError as e:
             respond_error(req_id, -32000, f"File not found: {getattr(e, 'filename', None) or 'unknown'}")
         except PermissionError:

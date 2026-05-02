@@ -278,14 +278,18 @@ describe("bridge.py integration tests", () => {
 
   // ── analyze_subset ──────────────────────────────────────────────
 
-  it("analyze_subset with non-existent font returns error", async () => {
+  it("analyze_subset with non-existent font returns FontNotFoundError code with hint", async () => {
     const res = await call("analyze_subset", {
       pdf_path: FIXTURE_PDF,
       text: "Hello",
       font_name: "NonExistentFont",
     });
     expect(res.error).toBeDefined();
-    expect(res.error!.code).toBe(-32000);
+    // CR-11 follow-up: FontNotFoundError now gets distinct code -32004 + hint
+    // (previously fell through to generic -32000).
+    expect(res.error!.code).toBe(-32004);
+    expect(res.error!.message).toMatch(/FontNotFoundError/);
+    expect(res.error!.message.toLowerCase()).toContain("hint:");
   });
 
   // ── Error handling ──────────────────────────────────────────────
