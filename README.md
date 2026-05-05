@@ -50,7 +50,7 @@ If you need fidelity guarantees for a specific PDF, run `pdf_analyze_subset` fir
 - **Batch operations** — up to 500 find-and-replace edits per call, up to 50 block replacements per page, with auto-verification on the output
 - **Section intelligence** — detects document structure by font hierarchy, swaps sections by fuzzy title match (raises on ambiguous match rather than silently picking)
 - **Atomic write** — section-swap operations write to a temp file and rename only on full success; failures leave your output path untouched
-- **Engine-version pin enforced at startup** — bridge hard-fails if `pdf-edit-engine < 0.1.2` is installed, so missing fidelity fields can't masquerade as `null`
+- **Engine-version pin enforced at startup** — bridge hard-fails if `pdf-edit-engine < 0.1.3` is installed, so missing fidelity fields can't masquerade as `null`
 - **Structured error codes** — engine errors map to specific JSON-RPC codes (`-32001` stale match, `-32002` encoding, `-32003` reflow, `-32004` font-not-found) with embedded recovery hints
 - **Runs entirely local** — no external APIs, no network calls, no API keys
 
@@ -60,7 +60,7 @@ If you need fidelity guarantees for a specific PDF, run `pdf_analyze_subset` fir
 
 - **Node.js** 20+
 - **Python** 3.12+
-- **pdf-edit-engine** ≥ 0.1.2: `pip install "pdf-edit-engine>=0.1.2"`
+- **pdf-edit-engine** ≥ 0.1.3, < 0.2.0: `pip install "pdf-edit-engine>=0.1.3,<0.2.0"`
 
 ### Claude Desktop
 

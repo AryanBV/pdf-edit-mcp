@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] — 2026-05-05
+
+**Required engine:** `pdf-edit-engine >= 0.1.3, < 0.2.0`. Co-versioned
+with the engine release; the wrapper jumps 0.1.1 → 0.1.3 (skips 0.1.2)
+to align version numbers between the two projects from this point on.
+
+### Added
+
+- **`degradations` array on every fidelity payload.** Typed list of
+  `{kind, detail, severity}` events surfacing visual-fidelity issues
+  (kerning compression/widening, font extension success/failure,
+  paragraph low-confidence detection, overflow shift behavior, heading
+  and marker font drops, line-height compression, reflow abort, font
+  coverage extension via cmap-only or system-font substitution).
+  Twelve canonical kinds; **clients should treat unknown kinds as
+  opaque (Permissive enum policy)** — future engine versions may add
+  new kinds without a wrapper bump. Per-edit detail lives at
+  `results[i].fidelity.degradations` for `pdf_replace_text` and
+  `pdf_batch_replace`; per-call detail at `fidelity.degradations` for
+  `pdf_replace_single`.
+- **Aggregated `any_degradation` and `degradation_kinds` fields** at
+  the top of `pdf_replace_text` (under `fidelity`) and
+  `pdf_batch_replace` (under `summary`). `any_degradation` is True iff
+  any per-edit `degradations` list is non-empty;
+  `degradation_kinds` is the sorted union of distinct kinds across
+  all edits — a stable summary that lets agentic consumers gate on a
+  small set rather than walking every result.
+
+### Compatibility
+
+- Existing `font_preserved` field semantics preserved. Engine-side it
+  is now a computed `@property` (INV-J-8) rather than a stored field,
+  but the JSON shape and value semantics are unchanged for clients
+  that previously gated on `fidelity.font_preserved == false`.
+- New clients should prefer `fidelity.any_degradation` /
+  `fidelity.degradation_kinds` as the visual-fidelity gate.
+  `font_preserved` tracks font-IDENTITY only (it remains True even
+  when `kerning_compressed` or `font_coverage_extended` fired,
+  because those preserve glyph identity).
+
 ## [0.1.1] — 2026-05-02
 
 Tracks `pdf-edit-engine` v0.1.2 — surfaces the new fidelity richness

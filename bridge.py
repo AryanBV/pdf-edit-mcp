@@ -204,7 +204,14 @@ def respond_error(req_id, code, message):
 
 
 def _serialize_edit_result(result):
-    """Convert an EditResult dataclass to a JSON-serializable dict."""
+    """Convert an EditResult dataclass to a JSON-serializable dict.
+
+    v0.1.3: adds the `degradations` array (typed visual-fidelity events)
+    sourced from `fidelity_report.degradations`. Each event is shaped
+    {kind, detail, severity}. The `font_preserved` value here is now a
+    computed @property on the engine side (INV-J-8); the JSON shape is
+    unchanged for back-compat.
+    """
     return {
         "success": result.success,
         "original_text": result.original_text,
@@ -217,6 +224,10 @@ def _serialize_edit_result(result):
             "overflow_detected": result.fidelity_report.overflow_detected,
             "reflow_applied": result.fidelity_report.reflow_applied,
             "glyphs_missing": result.fidelity_report.glyphs_missing,
+            "degradations": [
+                {"kind": d.kind, "detail": d.detail, "severity": d.severity}
+                for d in result.fidelity_report.degradations
+            ],
         },
     }
 
@@ -299,6 +310,17 @@ def handle_replace_text(params):
             "any_substitution": any(
                 bool(r.fidelity_report.font_substituted) for r in results
             ),
+            # v0.1.3: typed visual-fidelity gate. any_degradation is True
+            # iff any per-result degradations list is non-empty;
+            # degradation_kinds is the sorted union of distinct kinds
+            # surfaced across all results — a stable summary that lets
+            # agents key on a small set rather than walk every result.
+            "any_degradation": any(
+                bool(r.fidelity_report.degradations) for r in results
+            ),
+            "degradation_kinds": sorted(
+                {d.kind for r in results for d in r.fidelity_report.degradations}
+            ),
         },
     }
 
@@ -345,6 +367,15 @@ def handle_batch_replace(params):
             "total": len(results),
             "succeeded": succeeded,
             "failed": len(results) - succeeded,
+            # v0.1.3: aggregated typed visual-fidelity surface across the
+            # batch. any_degradation / degradation_kinds mirror the
+            # replace_text aggregator. Per-edit detail in results[i].fidelity.
+            "any_degradation": any(
+                bool(r.fidelity_report.degradations) for r in results
+            ),
+            "degradation_kinds": sorted(
+                {d.kind for r in results for d in r.fidelity_report.degradations}
+            ),
         },
         "verification": verification,
     }
@@ -1428,13 +1459,13 @@ METHODS = {
 # ── Main loop ─────────────────────────────────────────────────────────
 
 def _check_engine_version():
-    """CR-5: hard-fail on engine < 0.1.2.
+    """v0.1.3: hard-fail on engine < 0.1.3.
 
-    The MCP relies on FidelityReport.font_substituted, glyphs_missing,
-    and the auto-overflow warning that v0.1.2 introduced. Older engines
-    silently degrade these fields to None / [], and the MCP would
-    return responses that look complete but lack the v0.1.1 features
-    the README and tool descriptions advertise. Fail fast instead.
+    The MCP relies on FidelityReport.degradations (typed visual-fidelity
+    events) that v0.1.3 introduced. Older engines do not populate the
+    field, so the MCP would return responses claiming `degradations: []`
+    when the engine actually emits no signal at all. Fail fast instead
+    of returning misleadingly empty arrays.
 
     If the version cannot be detected (dev install, missing __version__),
     we WARN but don't refuse — the developer is presumed to know what
@@ -1443,7 +1474,7 @@ def _check_engine_version():
     if _engine_version == "unknown":
         print(
             "WARNING: pdf-edit-engine version could not be detected. "
-            "v0.1.1 of the MCP requires engine >=0.1.2.",
+            "v0.1.3 of the MCP requires engine >=0.1.3.",
             file=sys.stderr,
             flush=True,
         )
@@ -1453,12 +1484,12 @@ def _check_engine_version():
         triple = tuple(int(p) for p in parts)
     except ValueError:
         return  # non-numeric version (e.g. dev tag) — skip the check
-    if triple < (0, 1, 2):
+    if triple < (0, 1, 3):
         print(
             f"FATAL: pdf-edit-engine v{_engine_version} is older than the "
-            "required v0.1.2. The v0.1.1 MCP relies on fidelity fields "
-            "(font_substituted, glyphs_missing) that older engines do not "
-            "populate. Run: pip install --upgrade 'pdf-edit-engine>=0.1.2'",
+            "required v0.1.3. The v0.1.3 MCP relies on the typed "
+            "FidelityReport.degradations field that older engines do not "
+            "populate. Run: pip install --upgrade 'pdf-edit-engine>=0.1.3,<0.2.0'",
             file=sys.stderr,
             flush=True,
         )

@@ -1,6 +1,6 @@
 {
   "name": "@aryanbv/pdf-edit-mcp",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "MCP server for format-preserving PDF text editing — find, replace, and batch-edit text in existing PDFs while preserving fonts, layout, and visual fidelity.",
   "type": "module",
   "bin": {
