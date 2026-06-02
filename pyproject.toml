@@ -62,6 +62,11 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.per-file-ignores]
+# server.py registers tools via bottom-of-file imports (decorator side-effects);
+# they must follow the `mcp` definition, so E402 is expected and intentional.
+"src/pdf_edit_mcp/server.py" = ["E402"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = true
