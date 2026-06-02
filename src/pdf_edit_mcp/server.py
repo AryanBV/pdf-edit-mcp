@@ -18,18 +18,21 @@ from mcp.server.fastmcp import FastMCP
 from pdf_edit_mcp import __version__
 from pdf_edit_mcp.constants import MIN_ENGINE_VERSION
 
-INSTRUCTIONS = """\
-pdf-edit-mcp edits text in existing PDFs while preserving fonts and layout.
-
-TOOL GUIDE:
-Section operations (swap, rewrite, move sections): pdf_swap_sections, pdf_replace_section
-Text operations (names, dates, typos, labels): pdf_replace_text, pdf_batch_replace
-Structure analysis (understand sections, fonts, layout): pdf_inspect, pdf_detect_sections
-Document operations (merge, split, rotate, encrypt): pdf_merge, pdf_split, pdf_rotate_pages, pdf_encrypt
-Annotations (links, highlights, bookmarks): pdf_get_annotations, pdf_add_annotation
-
-Always output to a NEW file path — never overwrite the input PDF.
-"""
+INSTRUCTIONS = (
+    "pdf-edit-mcp edits text in existing PDFs while preserving fonts and layout.\n"
+    "\n"
+    "TOOL GUIDE:\n"
+    "Section operations (swap, rewrite, move sections): "
+    "pdf_swap_sections, pdf_replace_section\n"
+    "Text operations (names, dates, typos, labels): pdf_replace_text, pdf_batch_replace\n"
+    "Structure analysis (understand sections, fonts, layout): "
+    "pdf_inspect, pdf_detect_sections\n"
+    "Document operations (merge, split, rotate, encrypt): "
+    "pdf_merge, pdf_split, pdf_rotate_pages, pdf_encrypt\n"
+    "Annotations (links, highlights, bookmarks): pdf_get_annotations, pdf_add_annotation\n"
+    "\n"
+    "Always output to a NEW file path — never overwrite the input PDF.\n"
+)
 
 mcp = FastMCP(name="pdf-edit-mcp", instructions=INSTRUCTIONS)
 # FastMCP's constructor takes no `version`; the version lives on the underlying
