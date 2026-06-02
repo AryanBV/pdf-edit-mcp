@@ -96,7 +96,7 @@ if __name__ == "__main__":
 # Added incrementally as each build phase lands. These imports run AFTER `mcp`
 # and `engine_lock` are defined above, so the tool modules can import them
 # without a circular-import failure.
-# (P2) from pdf_edit_mcp import tools_read       # noqa: E402,F401
+from pdf_edit_mcp import tools_read  # noqa: E402,F401
 # (P3) from pdf_edit_mcp import tools_edit        # noqa: E402,F401
 # (P4) from pdf_edit_mcp import tools_sections    # noqa: E402,F401
 # (P5) from pdf_edit_mcp import tools_document, tools_annotations  # noqa: E402,F401
