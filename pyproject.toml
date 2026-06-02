@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pdf-edit-mcp"
+version = "0.2.0"
+description = "MCP server for format-preserving PDF text editing — find, replace, and batch-edit text in existing PDFs while preserving fonts, layout, and visual fidelity."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Aryan B V" }]
+keywords = [
+    "mcp",
+    "mcp-server",
+    "pdf",
+    "pdf-edit",
+    "pdf-replace",
+    "format-preserving",
+    "model-context-protocol",
+    "claude",
+    "ai-tools",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Text Processing",
+]
+dependencies = [
+    "mcp>=1.27.2,<2",
+    "pdf-edit-engine>=0.2.0,<0.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "reportlab", "mypy", "ruff"]
+
+[project.scripts]
+pdf-edit-mcp = "pdf_edit_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/AryanBV/pdf-edit-mcp"
+Repository = "https://github.com/AryanBV/pdf-edit-mcp.git"
+Issues = "https://github.com/AryanBV/pdf-edit-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pdf_edit_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/pdf_edit_mcp", "README.md", "CHANGELOG.md", "LICENSE", "server.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/pdf_edit_mcp"]

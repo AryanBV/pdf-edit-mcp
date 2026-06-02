@@ -148,3 +148,11 @@ tests/fixtures/*.pdf
 
 # Release artifacts (one-shot helper files for `gh release create`)
 .release-notes-*.md
+
+# Python (v0.2.0 conversion to FastMCP)
+.venv/
+*.egg-info/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
