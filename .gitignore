@@ -151,8 +151,11 @@ tests/fixtures/*.pdf
 
 # Python (v0.2.0 conversion to FastMCP)
 .venv/
+.venv*/
 *.egg-info/
 *.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# build output (standard `dist/` already ignored above; `distpy/` is a scratch build dir)
+distpy/
