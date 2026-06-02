@@ -22,7 +22,7 @@ from pdf_edit_engine.errors import (
     ReflowError,
 )
 
-from pdf_edit_mcp.server import engine_lock
+from pdf_edit_mcp.app import engine_lock
 
 # Two annotation profiles, ported from the v0.1.x TS read-only vs write hints.
 READ_ONLY = ToolAnnotations(

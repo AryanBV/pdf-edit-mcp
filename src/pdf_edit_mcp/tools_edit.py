@@ -18,6 +18,7 @@ from pdf_edit_engine.errors import PDFEditError
 from pydantic import Field
 
 from pdf_edit_mcp._runtime import WRITE, engine_guard
+from pdf_edit_mcp.app import mcp
 from pdf_edit_mcp.constants import (
     DEFAULT_FONT_SIZE,
     MAX_COORDINATE,
@@ -33,7 +34,6 @@ from pdf_edit_mcp.constants import (
     MIN_LINE_HEIGHT,
 )
 from pdf_edit_mcp.serialize import aggregate_fidelity, serialize_edit_result
-from pdf_edit_mcp.server import mcp
 from pdf_edit_mcp.validation import BBox, BlockReplacement, EditItem, OutputPath, PdfPath
 
 _Search = Annotated[

@@ -17,8 +17,8 @@ from pdf_edit_engine.errors import PDFEditError
 from pydantic import Field
 
 from pdf_edit_mcp._runtime import READ_ONLY, engine_guard, page_count
+from pdf_edit_mcp.app import mcp
 from pdf_edit_mcp.constants import MAX_SEARCH_TEXT
-from pdf_edit_mcp.server import mcp
 from pdf_edit_mcp.validation import BBox, PdfPath
 
 
