@@ -65,10 +65,10 @@ if __name__ == "__main__":
 # `app.mcp` is an import leaf, so importing the tool modules here does not cycle
 # back through `server`. Added incrementally as each build phase lands.
 from pdf_edit_mcp import (  # noqa: E402
+    tools_annotations,  # noqa: F401
+    tools_document,  # noqa: F401
     tools_edit,  # noqa: F401
     tools_read,  # noqa: F401
     tools_sections,  # noqa: F401
 )
-
-# (P5) from pdf_edit_mcp import tools_document, tools_annotations  # noqa: E402,F401
 # (P6) from pdf_edit_mcp import prompts           # noqa: E402,F401
