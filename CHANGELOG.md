@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] — 2026-06-02
+
+**Rewritten as a native Python (FastMCP) MCP server.** Co-versioned with
+`pdf-edit-engine >= 0.2.0, < 0.3`. Python >= 3.10.
+
+### Changed — architecture & distribution
+
+- The server is now a single-process Python application built on the official
+  MCP SDK (`mcp` / FastMCP). The previous TypeScript MCP server + long-running
+  `bridge.py` subprocess are **removed**; the engine is imported in-process.
+  No Node.js runtime, no JSON-RPC bridge.
+- **Distribution moves from npm to PyPI** — `uvx pdf-edit-mcp` (or
+  `pip install pdf-edit-mcp`). The npm package `@aryanbv/pdf-edit-mcp` is
+  deprecated; the `PDF_EDIT_PYTHON` env var is gone.
+- Engine errors now surface as FastMCP `isError` tool results carrying the same
+  classified message **+ recovery hint** (the numeric JSON-RPC codes
+  `-32001..-32004` were a transport artifact and do not survive the model).
+- Engine-version gate raised to `>= 0.2.0` (was 0.1.3).
+
+### Added — engine v0.2.0 surface
+
+- **Edit encrypted PDFs** — a `password=` kwarg on the read/edit tools opens a
+  password-protected PDF; the output is re-encrypted with the same password
+  (engine A2.3). Raw pikepdf password errors are never leaked.
+- **`fit="none"|"shrink"`** on `pdf_replace_block` / `pdf_batch_replace_block`
+  (engine E.8 shrink-to-fit).
+- The 30 engine `DegradationKind`s (17 new since 0.1.3 — CFF/CJK/encryption/
+  linearization/etc.) flow through every fidelity report unchanged.
+- `python -m pdf_edit_mcp` entry point in addition to the `pdf-edit-mcp` console
+  script.
+
+### Preserved (byte-compatible)
+
+- All **38 tools + 3 prompts**, with identical names, descriptions, input schemas,
+  and return shapes. `pdf_detect_sections` output is byte-identical to 0.1.x
+  (verified by differential).
+- The 8-check path-safety boundary, ambiguous-section refusal, atomic swap, the
+  `page_number` deprecated alias, per-edit fidelity reports, and `dry_run` semantics.
+
+### Fixed
+
+- The output-overwrite warning now **appends** to the engine's warnings instead of
+  replacing them (the 0.1.x TS layer discarded engine warnings in that case).
+
 ## [0.1.3] — 2026-05-05
 
 **Required engine:** `pdf-edit-engine >= 0.1.3, < 0.2.0`. Co-versioned

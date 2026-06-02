@@ -1,63 +1,94 @@
 # pdf-edit-mcp
 
-MCP server for format-preserving PDF text editing, powered by pdf-edit-engine (Python).
+MCP server for format-preserving PDF text editing, powered by
+[pdf-edit-engine](https://github.com/AryanBV/pdf-edit-engine) (Python). As of
+v0.2.0 this is a **single-process Python (FastMCP) server** — the engine is
+imported in-process. (The v0.1.x TypeScript server + `bridge.py` subprocess are
+gone; see git history / CHANGELOG.)
 
 ## Architecture
 
 ```
 Claude / AI Agent
-    ↓ MCP protocol (stdio, JSON-RPC)
-src/index.ts (TypeScript MCP server)
-    ↓ spawns once at startup, JSON-RPC 2.0 over stdin/stdout
-bridge.py (long-running Python process)
-    ↓ direct import
-pdf-edit-engine (Python library)
+    ↓ MCP protocol (stdio)
+pdf_edit_mcp (FastMCP server, this package)
+    ↓ in-process import
+pdf-edit-engine (Python library: pikepdf + fonttools + pdfminer)
 ```
 
-## Critical Rules
+## Module layout (dependency order)
 
-1. **bridge.py stdout is the IPC channel** — NEVER use `print()` in bridge.py. All logging goes to `sys.stderr`. The original stdout is saved as `_stdout` and used exclusively for JSON-RPC responses.
+```
+__init__.py      __version__
+app.py           FastMCP `mcp` instance + `engine_lock`  ← dependency LEAF
+constants.py     input bounds (single source of truth)
+validation.py    path_safety_error + PdfPath/OutputPath/DirPath + BBox/EditItem/BlockReplacement
+serialize.py     serialize_edit_result + aggregate_fidelity (exact wire shapes)
+_runtime.py      engine_guard (lock + error translation), READ_ONLY/WRITE annotations, page_count
+tools_read.py    9 read tools        tools_edit.py     7 edit tools
+tools_sections.py 3 section tools     tools_document.py 15 document tools
+tools_annotations.py 5 annotation tools  prompts.py     3 prompts
+server.py        version gate + main(); imports the tool/prompt modules to register them
+```
 
-2. **Python process is spawned ONCE** — bridge.py is started at server startup and kept alive for all tool calls. If it dies unexpectedly, the TS server attempts ONE restart. If restart fails, tools return errors.
+**Import-cycle rule:** `mcp` and `engine_lock` live in `app.py` (a leaf). Tool
+modules import them from `app`, never from `server`. `server` imports the tool
+modules at the bottom for decorator side-effects. Do not move `mcp`/`engine_lock`
+back into `server` — that reintroduces the `server → tools_* → _runtime → server`
+cycle.
 
-3. **PDF path validation** — All `pdf_path` and `output_path` inputs must be absolute paths ending with `.pdf`. Validated by Zod schemas in the TS server before reaching bridge.py.
+## Critical rules
 
-4. **No `any` or `unknown`** — TypeScript strict mode, ESM only. All types must be explicit.
+1. **stdout is the MCP transport** — never `print()` to stdout; diagnostics go to
+   `stderr` (the engine version gate already does this).
+2. **The engine is NOT thread-safe** — every engine call goes through
+   `_runtime.engine_guard()`, which holds the module-level `engine_lock`. New tools
+   must wrap their engine work in `with engine_guard():`.
+3. **Path validation is a security boundary** — path parameters use the `PdfPath` /
+   `OutputPath` / `DirPath` validated types from `validation.py` (absolute, `.pdf`,
+   no `..` traversal, no control chars, no Windows reserved/truncated basenames).
+   Never accept a bare `str` for a path.
+4. **Error model** — engine `PDFEditError` subclasses are translated by
+   `engine_guard` into `ToolError` with a classified message + recovery hint. Raise
+   `PDFEditError` for in-tool validation; do not leak raw pikepdf exceptions.
+5. **Engine version gate** — `server._check_engine_version()` exits non-zero if the
+   installed `pdf-edit-engine < 0.2.0` (relies on the `password=` kwargs, `fit=`,
+   and the 30-kind degradation taxonomy).
+6. **mypy --strict + ruff clean** — `mypy src/pdf_edit_mcp` and `ruff check src/ tests/`
+   must pass. `server.py` has a per-file E402 ignore (intentional bottom-of-file
+   registration imports).
 
-5. **Serialized bridge calls** — Only one JSON-RPC request is in-flight at a time. The TS server queues requests.
+## Conventions
 
-6. **Engine version pin** — `bridge.py` hard-fails (`sys.exit(2)`) at startup if the installed `pdf-edit-engine` is older than `0.1.2`. The MCP relies on `FidelityReport.font_substituted` and `glyphs_missing` fields that older engines do not populate.
+- **Tool function names ARE the wire names** — `pdf_*` exactly (e.g.
+  `pdf_delete_annotation_v2`). Prompts use `@mcp.prompt(name="...")` for the
+  hyphenated wire names.
+- **Page parameters are named `page`**, 0-indexed. `pdf_batch_replace_block` keeps
+  `page_number` as a deprecated alias (prefer `page`; both → error if neither set).
+- **Bounds come from `constants.py`** — never inline a magic number.
+- **`password=`** is exposed only on the direct-verb read/edit tools whose engine
+  call accepts it — NOT on composite tools (`pdf_inspect`, the section tools) or
+  the document wrappers (the engine wrapper functions don't take it).
+- **Return shapes are pinned** by the test suite — preserve `serialize_edit_result`'s
+  exact dict shape and each tool's documented return keys.
 
-7. **Naming conventions** (anchor these to prevent the kind of drift the v0.1.1 audit caught):
-   - **Page parameters are always named `page`** — 0-indexed integer. Never `page_number`, `page_idx`, `pg`, `page_num`. (`pdf_batch_replace_block` keeps `page_number` as a deprecated alias for v0.1.0 callers; will be dropped in v0.2.0.)
-   - **Replacement-text length cap is `MAX_REPLACEMENT_TEXT = 100_000`** in `src/schemas.ts`. New text-replacement fields must use that constant, not an inline `.max(50_000)` or other magic number.
-   - **Path schemas** (`pdfPathSchema`, `outputPathSchema`) are the only sources of truth for path validation. New tools accepting paths reuse these — never re-roll path-shape `.refine()` chains.
-   - **Engine error codes** (`-32001`..`-32004`) are reserved by `_ERROR_REGISTRY` in `bridge.py` for `OperatorError`, `EncodingError`, `ReflowError`, `FontNotFoundError` respectively. New engine error classes get their own code + recovery hint in the registry, not an ad-hoc except clause.
+## Section detection lives in tools_sections.py
 
-## Tech debt — section detection lives in bridge.py
+`_detect_sections` / `_swap_sections` / `_replace_section` are an MCP-side
+font-hierarchy heuristic + orchestration ported verbatim from the old `bridge.py`
+(detect output is byte-identical, verified by differential). This logic could move
+into `pdf_edit_engine.structural` so non-MCP callers reuse it; tracked for a future
+release. Do not extend the MCP-side detector with significant new logic — push new
+work into the engine first.
 
-`bridge.py:handle_detect_sections` (~150 LOC) implements an MCP-side font-frequency heuristic to build a section tree from `get_text_layout`. This logic could plausibly belong in `pdf_edit_engine.structural` instead — pushing it down would let non-MCP callers reuse it, and the MCP would shrink to a thin wrapper. Tracked for v0.2.x. Do not extend this MCP-side detector with significant new logic; if changes are needed, push the work into the engine first.
+## Development
 
-`handle_swap_sections` and `handle_replace_section` follow the same pattern (MCP-side orchestration around engine primitives). They use `_resolve_section` for unique-match resolution (raises on ambiguous), and `handle_swap_sections` writes its output to a `.swap_tmp` sibling and atomically renames on full success.
+```bash
+pip install -e ".[dev]"
+ruff check src/ tests/
+mypy src/pdf_edit_mcp
+pytest tests/ -q          # fixtures auto-generated via reportlab (tests/conftest.py)
+```
 
-## Configuration
-
-- `PDF_EDIT_PYTHON` env var: path to Python executable (default: `"python"`)
-- Python 3.12+ required with `pdf-edit-engine` installed
-
-## MCP SDK Patterns
-
-- Import `McpServer` from `@modelcontextprotocol/sdk/server/mcp.js`
-- Import `StdioServerTransport` from `@modelcontextprotocol/sdk/server/stdio.js`
-- Tools registered via `server.registerTool(id, {description, inputSchema, annotations}, handler)`
-- Zod schemas use `.strict()` — no extra properties allowed
-- No `outputSchema` on tools (Claude Code drops tools that have it)
-- `console.error` only — stdout is the MCP transport channel
-
-## File Layout
-
-- `bridge.py` — Python JSON-RPC process (project root, ships with npm package)
-- `src/index.ts` — MCP server entry point
-- `src/schemas.ts` — Zod validation schemas (shared with tests)
-- `dist/` — compiled output (gitignored)
-- `tests/` — vitest tests
+Distribution: PyPI (`uvx pdf-edit-mcp`). Build with `python -m build`; publish with
+`twine` (manual, mirroring the engine's release process).

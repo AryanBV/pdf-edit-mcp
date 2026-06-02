@@ -12,10 +12,9 @@ import os
 import sys
 
 try:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.lib.units import inch
-    from reportlab.pdfgen import canvas
     from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
 except ImportError:
     print("reportlab not installed. Run: pip install reportlab", file=sys.stderr)
     sys.exit(1)

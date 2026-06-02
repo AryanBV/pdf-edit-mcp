@@ -2,11 +2,12 @@
 
 MCP server for editing text in existing PDFs through content-stream surgery. Targets fidelity preservation (original font, exact position, in-place operators) and reports — honestly — when fidelity has to break.
 
-[![npm version](https://img.shields.io/npm/v/@aryanbv/pdf-edit-mcp)](https://www.npmjs.com/package/@aryanbv/pdf-edit-mcp)
+[![PyPI version](https://img.shields.io/pypi/v/pdf-edit-mcp)](https://pypi.org/project/pdf-edit-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/AryanBV/pdf-edit-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/AryanBV/pdf-edit-mcp/actions/workflows/ci.yml)
-![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)
-![Python](https://img.shields.io/badge/python-%3E%3D3.12-blue)
+![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue)
+
+> **v0.2.0 is a native Python (FastMCP) server.** Earlier 0.1.x releases were a TypeScript MCP server that shelled out to a Python `bridge.py`; v0.2.0 imports the engine in-process — **one runtime, no Node.js**, distributed on PyPI. See [Migrating from 0.1.x](#migrating-from-01x-npm).
 
 ## How it works
 
@@ -19,48 +20,49 @@ pdf-edit-mcp takes a different approach. It modifies the original PDF content st
 | **Method** | Redact old text, stamp new text | Modify content stream operators in place |
 | **Font** | Substituted (often Helvetica) | Original font when possible; metric-equivalent fallback (e.g. Carlito for Calibri) when not |
 | **Position** | Re-calculated | Exact original coordinates |
-| **Quality feedback** | None | FidelityReport on every edit (font_substituted, glyphs_missing, overflow_detected, warnings) |
+| **Quality feedback** | None | FidelityReport on every edit (`font_preserved`, `font_substituted`, `glyphs_missing`, `overflow_detected`, typed `degradations`) |
 
-Powered by [pdf-edit-engine](https://github.com/AryanBV/pdf-edit-engine) — a Python library for PDF content stream surgery with two-tier font subset extension.
+Powered by [pdf-edit-engine](https://github.com/AryanBV/pdf-edit-engine) — a Python library for PDF content stream surgery with in-place font subset extension.
 
 ## When fidelity is exact, and when it isn't
 
-This matters more than the headline claim. The engine has three fidelity tiers, and every edit's `FidelityReport` tells you which one fired:
+This matters more than the headline claim. Every edit's fidelity report tells you which tier fired:
 
 - **Tier 1 — exact** (`font_preserved=true`, `font_substituted=null`): the embedded font already had every glyph the replacement needs. Output is byte-identical at the operator layer.
-- **Tier 1.5 — in-place injection** (`font_preserved=true`, glyph appended to embedded font): glyph wasn't in the embedded font but was in your system font with the same `unitsPerEm`. The original CIDs are preserved; only new glyphs are appended at fresh GIDs. Visual: indistinguishable from Tier 1.
-- **Metric-equivalent fallback** (`font_preserved=false`, `font_substituted="Carlito-Regular"` or similar): the original font isn't installed system-wide, so an open-source font with matching metrics substitutes for the new glyphs. Visual: very close but not pixel-perfect; spacing is right because metrics match.
+- **Tier 1.5 — in-place injection** (`font_preserved=true`): the glyph wasn't embedded but was in your system font with matching `unitsPerEm`. Original CIDs are preserved; only new glyphs are appended. Visually indistinguishable from Tier 1. Covers TrueType (`glyf`) **and**, as of engine v0.2.0, CID-keyed (Type0) CFF / Type1C fonts.
+- **Metric-equivalent fallback** (`font_preserved=false`, `font_substituted="Carlito-Regular"` or similar): the original font isn't installed, so an open-source font with matching metrics is used for the new glyphs. Very close, spacing correct, not pixel-perfect.
 
-What straight-up fails (the engine raises, the MCP returns a structured error):
-- The font is CFF / Type 1 / Type 3 (`FontNotFoundError` — TrueType only for Tier 1.5 today).
-- The `unitsPerEm` of the system font differs from the embedded font (rescaling out of scope).
-- The replacement is wider than the available bbox AND there's no room to reflow downward (`OverflowError` surfaced via `EditResult.warnings`).
-- Multi-codepoint emoji or scripts the system fonts don't carry.
+What still refuses honestly (a typed `font_extension_failed` / clear error rather than silent corruption):
 
-If you need fidelity guarantees for a specific PDF, run `pdf_analyze_subset` first to see what tier you'll land in.
+- CFF shapes the injector doesn't cover — simple-font (non-CID) CFF, CFF2, name-keyed CFF, multi-FD CID, composite donors.
+- Type 3 (procedural) fonts.
+- `unitsPerEm` mismatch between embedded and system font (rescaling out of scope).
+- A replacement wider than the bbox with no room to reflow (`overflow_detected=true` + a warning).
+- Multi-codepoint emoji / scripts your system fonts don't carry (`glyphs_missing`).
+
+Run `pdf_analyze_subset` first if you need to know the tier up front.
 
 ## Features
 
-- **38 tools** across 7 categories (reading, text editing, block ops, section ops, annotations, document manipulation, metadata & security)
-- **3 built-in MCP prompts** that guide the editing workflow step by step
-- **Fidelity reporting** on every edit: `font_preserved`, `font_substituted`, `overflow_detected`, `reflow_applied`, `glyphs_missing`, plus a `warnings` list (auto-includes overflow notices)
-- **`dry_run` preview** on `pdf_replace_text`, `pdf_replace_single`, `pdf_batch_replace` — return the FidelityReport without writing the output PDF, so you can verify font/glyph coverage before committing
-- **Per-page filtering** on `pdf_find_text`, `pdf_get_text`, `pdf_get_fonts` — restrict reads to a single 0-indexed page on multi-page PDFs
-- **Layout overrides** on `pdf_replace_block` and `pdf_batch_replace_block` — explicit `line_height` and `section_gap` for uniform spacing across sibling sections
-- **Batch operations** — up to 500 find-and-replace edits per call, up to 50 block replacements per page, with auto-verification on the output
-- **Section intelligence** — detects document structure by font hierarchy, swaps sections by fuzzy title match (raises on ambiguous match rather than silently picking)
-- **Atomic write** — section-swap operations write to a temp file and rename only on full success; failures leave your output path untouched
-- **Engine-version pin enforced at startup** — bridge hard-fails if `pdf-edit-engine < 0.1.3` is installed, so missing fidelity fields can't masquerade as `null`
-- **Structured error codes** — engine errors map to specific JSON-RPC codes (`-32001` stale match, `-32002` encoding, `-32003` reflow, `-32004` font-not-found) with embedded recovery hints
-- **Runs entirely local** — no external APIs, no network calls, no API keys
+- **38 tools** across 7 categories (reading, text editing, block ops, section ops, annotations, document manipulation, metadata & security) + **3 built-in MCP prompts** that guide the editing workflow.
+- **Edit encrypted PDFs** — pass `password=` to the read/edit tools to work on a password-protected PDF; the output is **re-encrypted** with the same password (engine A2.3).
+- **Shrink-to-fit** — `fit="shrink"` on `pdf_replace_block` / `pdf_batch_replace_block` shrinks the font to fit a fixed-height region (engine E.8).
+- **Fidelity reporting** on every edit: `font_preserved`, `font_substituted`, `overflow_detected`, `reflow_applied`, `glyphs_missing`, a `warnings` list, and a typed `degradations` array (30 engine degradation kinds, each `{kind, detail, severity}`) so callers can gate on quality.
+- **`dry_run` preview** on `pdf_replace_text` / `pdf_replace_single` / `pdf_batch_replace` — get the fidelity report without writing the output.
+- **Per-page filtering** on `pdf_find_text` / `pdf_get_text` / `pdf_get_fonts`.
+- **Batch operations** — up to 500 find-and-replace edits per call, up to 50 block replacements per page, with output auto-verification on `pdf_batch_replace`.
+- **Section intelligence** — detects structure by font hierarchy, swaps sections by fuzzy title match and **refuses ambiguous matches** rather than silently picking the first.
+- **Atomic write** — `pdf_swap_sections` writes to a temp file and renames only on full success; a failure leaves your output path untouched.
+- **Engine-version gate at startup** — refuses to serve against `pdf-edit-engine < 0.2.0`, so missing fidelity fields can't masquerade as `null`.
+- **Path-safety boundary** — every path is validated (absolute, `.pdf`, no `..` traversal, no control chars, no Windows reserved/truncated basenames) before reaching the engine.
+- **Runs entirely local** — no external APIs, no network calls, no API keys.
 
 ## Quick Start
 
 ### Prerequisites
 
-- **Node.js** 20+
-- **Python** 3.12+
-- **pdf-edit-engine** ≥ 0.1.3, < 0.2.0: `pip install "pdf-edit-engine>=0.1.3,<0.2.0"`
+- **Python** 3.10+ (3.12 recommended).
+- That's it — [`pdf-edit-engine`](https://pypi.org/project/pdf-edit-engine/) installs automatically as a dependency. (`uvx` fetches everything on first run; no manual install.)
 
 ### Claude Desktop
 
@@ -69,9 +71,9 @@ Add to your `claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
-    "pdf-edit-mcp": {
-      "command": "npx",
-      "args": ["-y", "@aryanbv/pdf-edit-mcp"]
+    "pdf-edit": {
+      "command": "uvx",
+      "args": ["pdf-edit-mcp"]
     }
   }
 }
@@ -80,31 +82,16 @@ Add to your `claude_desktop_config.json`:
 ### Claude Code
 
 ```bash
-claude mcp add pdf-edit-mcp -- npx -y @aryanbv/pdf-edit-mcp
+claude mcp add pdf-edit -- uvx pdf-edit-mcp
 ```
 
 ### Other MCP clients (Cursor, Windsurf, etc.)
 
+Run via `uvx pdf-edit-mcp`, or install it and use the console script:
+
 ```bash
-npx -y @aryanbv/pdf-edit-mcp
-```
-
-### Custom Python path
-
-If `python` isn't in your PATH or you need a specific version:
-
-```json
-{
-  "mcpServers": {
-    "pdf-edit-mcp": {
-      "command": "npx",
-      "args": ["-y", "@aryanbv/pdf-edit-mcp"],
-      "env": {
-        "PDF_EDIT_PYTHON": "/path/to/python3.12"
-      }
-    }
-  }
-}
+pip install pdf-edit-mcp
+pdf-edit-mcp          # or: python -m pdf_edit_mcp
 ```
 
 ## Tools
@@ -135,9 +122,9 @@ If `python` isn't in your PATH or you need a specific version:
 
 | Tool | Description |
 |------|-------------|
-| `pdf_replace_block` | Replace all content within a bounding box with new text |
-| `pdf_batch_replace_block` | Replace content in multiple bounding boxes atomically with cumulative shift tracking |
-| `pdf_insert_text_block` | Insert text at a position, shift existing content down to make room |
+| `pdf_replace_block` | Replace all content within a bounding box with new text (`fit="shrink"` to shrink-to-fit) |
+| `pdf_batch_replace_block` | Replace content in multiple bounding boxes atomically |
+| `pdf_insert_text_block` | Insert text at a position |
 | `pdf_delete_block` | Delete content in a bounding box, optionally close the gap |
 
 ### Section Operations
@@ -184,115 +171,63 @@ If `python` isn't in your PATH or you need a specific version:
 
 ## Workflows
 
-Three built-in MCP prompts guide the editing process.
-
-### `comprehensive-pdf-edit`
-
-For structural changes — section swaps, rewrites, multi-field updates:
-
-1. **Inspect** — Call `pdf_inspect` to get the full document overview
-2. **Understand structure** — Use `pdf_detect_sections` for section tree, `pdf_find_text` for simple text matches, or `pdf_get_text_layout` for raw block positions
-3. **Pre-check** — Call `pdf_analyze_subset` if replacement text has unusual characters (bullets, em-dashes, non-Latin scripts)
-4. **Execute** — Use `pdf_batch_replace` for text changes, `pdf_swap_sections` or `pdf_replace_section` for structural changes, then `pdf_update_annotation` if link URLs changed
-5. **Verify** — Call `pdf_get_text` on the output. Check for duplicates, missing content, and spurious spaces
-
-### `section-swap`
-
-For swapping two sections by name:
-
-1. Call `pdf_detect_sections` to get the section tree
-2. Identify both sections by title match
-3. Call `pdf_batch_replace_block` with **all** sibling sections (not just the two being swapped) — unchanged siblings get their original text for uniform spacing
-4. Verify with `pdf_get_text`
-
-### `quick-pdf-edit`
-
-For simple text changes — typos, dates, names:
-
-1. Call `pdf_find_text` to locate the text
-2. Call `pdf_replace_text` or `pdf_replace_single`
-3. Check `font_preserved` in the fidelity report
+Three built-in MCP prompts guide the editing process: **`comprehensive-pdf-edit`** (structural changes — inspect → understand structure → pre-check → execute → verify), **`section-swap`** (swap two sections, re-rendering all siblings for uniform spacing), and **`quick-pdf-edit`** (simple typo/date/name changes with a fidelity check).
 
 ## Architecture
 
 ```
 AI Agent (Claude, GPT, etc.)
     ↓  MCP protocol (stdio)
-index.ts — TypeScript MCP server
-    ↓  JSON-RPC 2.0 over stdin/stdout
-bridge.py — long-running Python subprocess
-    ↓  direct import
+pdf_edit_mcp — Python FastMCP server (this package)
+    ↓  in-process import
 pdf-edit-engine — Python library (pikepdf + fonttools + pdfminer)
 ```
 
-- The TypeScript server spawns `bridge.py` once at startup and keeps it alive for all tool calls, avoiding Python startup overhead on every request.
-- All inputs are validated by Zod schemas before reaching the Python layer.
-- `stdout` is the IPC channel — all logging goes to `stderr`.
+- Single process: the engine is imported directly — no subprocess, no JSON-RPC bridge, no Node.js.
+- Inputs are validated by Pydantic models (path safety, bounds, strict object shapes) before reaching the engine.
+- Engine calls are serialized under a lock (the engine is not thread-safe) and `PDFEditError`s are translated to clean tool errors with recovery hints.
+- `stdout` is the MCP transport — all diagnostics go to `stderr`.
 
-## Tested PDF generators
-
-| Generator | Encoding | Character agreement | Notes |
-|-----------|----------|-------------------|-------|
-| Chrome (Print to PDF) | Identity-H | 100% | Narrow font subsets exercise Tier 1.5 in-place glyph injection |
-| Google Docs export | Identity-H | 100% | |
-| Microsoft Word | Identity-H (Calibri) | 100% with Carlito metric-equivalent installed | `font_substituted` set when fallback fires |
-| reportlab (Python) | WinAnsi | 100% | Synthetic test fixture |
+Layout: `server.py` (entry + version gate), `app.py` (FastMCP instance + lock), `validation.py`, `serialize.py`, `_runtime.py`, and `tools_*.py` / `prompts.py` (the tool + prompt surface).
 
 ## Limitations
 
-What v0.1.1 does **not** support:
+- **Cross-page reflow** — text expanding past a page boundary is not redistributed (`overflow_detected=true` + a warning).
+- **Some CFF shapes** — CID-keyed (Type0) CFF/Type1C is supported; simple-font CFF, CFF2, name-keyed CFF, multi-FD CID, and composite donors refuse honestly (`font_extension_failed`).
+- **`unitsPerEm` mismatch** between embedded and system font — out of scope; refuses rather than distort.
+- **Image editing / table semantics** — text-only.
+- **Right-to-left / complex-script shaping** — bidi reordering is not handled; CJK line-breaking is supported (engine E.7).
+- **Multi-codepoint emoji** not in your system fonts — recorded as `glyphs_missing`.
 
-- **Cross-page reflow** — text expanding past a page boundary is not redistributed; you'll see an `overflow_detected: true` and a warning
-- **CFF / Type 1 / Type 3 fonts** — Tier 1.5 in-place glyph injection is TrueType only (`FontFile2` ↔ `glyf` table). Edits that need new glyphs in a CFF font return `FontNotFoundError` with code `-32004`
-- **`unitsPerEm` mismatch** — if the embedded font and your installed system font use different `unitsPerEm`, glyph rescaling is out of scope; the engine raises rather than ship distorted output
-- **Image editing or generation** — text-only
-- **Table structure detection** — text and bbox extraction work, but no table semantics
-- **Encodings beyond Identity-H and WinAnsi** — `MacRoman` and custom `/Differences` are decoded for reading but not exercised by the test fixtures
-- **Right-to-left text** — bidi reordering is not handled
-- **Multi-codepoint emoji / complex script glyphs** that aren't in your system fonts — recorded as `glyphs_missing` in the FidelityReport
+## Errors
 
-## Error codes
+Engine failures surface as MCP tool errors (`isError`) carrying a classified message **and a recovery hint** — for example:
 
-JSON-RPC error codes the bridge can return (in addition to standard `-32600`/`-32601`/`-32602`):
+- `OperatorError` → *"TextMatch is stale — re-run pdf_find_text and retry."*
+- `EncodingError` → *"…run pdf_analyze_subset to check coverage."*
+- `ReflowError` → *"Replacement may be too wide — try shorter text or a different bbox."*
+- `FontNotFoundError` → *"Run pdf_get_fonts, or install the required font / accept a fallback."*
 
-| Code | Class | Hint |
-|---|---|---|
-| `-32000` | `PDFEditError` (generic) | Inspect the message for context |
-| `-32001` | `OperatorError` | TextMatch is stale — re-run `pdf_find_text` and retry |
-| `-32002` | `EncodingError` | Run `pdf_analyze_subset` to see which characters can't encode |
-| `-32003` | `ReflowError` | Replacement may be too wide for the bbox — try shorter text |
-| `-32004` | `FontNotFoundError` | Install the original font system-wide, or accept metric-equivalent fallback |
-| `-32603` | Internal error | Bug — please report at the issue tracker |
+Raw pikepdf exceptions (e.g. on an encrypted PDF opened without a password) are never leaked — you get a clean "password-protected" message instead.
 
-## Troubleshooting
+## Migrating from 0.1.x (npm)
 
-**"Python not found"** — Set `PDF_EDIT_PYTHON` to your Python 3.12+ path (see [Custom Python path](#custom-python-path)).
-
-**"No module named pdf_edit_engine"** — Install the engine: `pip install pdf-edit-engine`
-
-**Bridge process crashes on startup** — Verify Python >=3.12 (`python --version`) and check stderr for import errors.
-
-**Characters not rendering after replacement** — Call `pdf_analyze_subset` before editing to check if the embedded font supports the new characters.
-
-**"Path must be absolute"** — All `pdf_path` and `output_path` values must be absolute paths ending in `.pdf`.
+The 0.1.x npm package `@aryanbv/pdf-edit-mcp` is deprecated. Replace the npm/`npx` launch config with the `uvx` config above. The tool names, inputs, and outputs are unchanged, so prompts and integrations keep working; you no longer need Node.js, and the `PDF_EDIT_PYTHON` env var is gone (the engine runs in-process).
 
 ## Development
 
 ```bash
 git clone https://github.com/AryanBV/pdf-edit-mcp.git
 cd pdf-edit-mcp
-npm install && npm run build
+python -m venv .venv && . .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
 ```
 
 ```bash
-npm test              # validation + security + integration tests
-npm run inspect       # launch MCP Inspector for manual testing
-npm run audit         # security audit
+ruff check src/ tests/        # lint
+mypy src/pdf_edit_mcp         # type-check (strict)
+pytest tests/ -q              # tests (fixtures auto-generated via reportlab)
 ```
-
-Integration tests require Python 3.12+, pdf-edit-engine, and reportlab (`pip install pdf-edit-engine reportlab`).
-
-CI runs in two stages: unit tests (TypeScript validation and security) → integration tests (Python bridge with generated fixtures).
 
 ## License
 

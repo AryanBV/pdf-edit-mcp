@@ -6,12 +6,12 @@
     "url": "https://github.com/AryanBV/pdf-edit-mcp",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.2.0",
   "packages": [
     {
-      "registryType": "npm",
-      "identifier": "@aryanbv/pdf-edit-mcp",
-      "version": "0.1.0",
+      "registryType": "pypi",
+      "identifier": "pdf-edit-mcp",
+      "version": "0.2.0",
       "transport": {
         "type": "stdio"
       }
