@@ -1,5 +1,7 @@
 # pdf-edit-mcp
 
+> 💼 Available for freelance MCP/AI integration work — DM [@aryansalian03](https://x.com/aryansalian03) or via [aryanbv.com](https://aryanbv.com)
+
 MCP server for editing text in existing PDFs through content-stream surgery. Targets fidelity preservation (original font, exact position, in-place operators) and reports — honestly — when fidelity has to break.
 
 [![PyPI version](https://img.shields.io/pypi/v/pdf-edit-mcp)](https://pypi.org/project/pdf-edit-mcp/)
